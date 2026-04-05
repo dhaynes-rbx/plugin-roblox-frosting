@@ -1,0 +1,18 @@
+---
+description: After every code change, rebuild the plugin into the Roblox Plugins folder
+alwaysApply: true
+---
+
+# Plugin Build
+
+After every code change, run the Rojo build command to deploy the plugin:
+
+```bash
+rojo build default.project.json --output ~/Documents/Roblox/Plugins/frosting.rbxmx
+```
+
+Do this before any testing step. If Rojo is not installed, install it first:
+
+```bash
+aftman install
+```

@@ -1,0 +1,6 @@
+{
+	"name": "frosting-plugin",
+	"tree": {
+		"$path": "src"
+	}
+}
