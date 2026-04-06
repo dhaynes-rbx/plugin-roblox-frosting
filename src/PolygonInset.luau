@@ -10,7 +10,79 @@
 -- above (+Y). The inward direction is therefore to the left of each edge
 -- direction vector.
 
-local MIN_BISECTOR_DOT = 0.05 -- clamp for near-parallel or reflex corners
+local MIN_BISECTOR_DOT = 0.05
+local COINCIDENT_EPS = 1e-6
+
+-- 2-D cross product of (a→b) relative to origin o.
+local function cross2D(o: Vector2, a: Vector2, b: Vector2): number
+	return (a.X - o.X) * (b.Y - o.Y) - (a.Y - o.Y) * (b.X - o.X)
+end
+
+--- Ear-clip triangulation of a simple CCW polygon.
+--- Returns an array of {i1, i2, i3} index triples (1-based into `poly`).
+local function earClipTriangulate(poly: { Vector2 }): { { number } }
+	local indices: { number } = {}
+	for i = 1, #poly do
+		table.insert(indices, i)
+	end
+
+	local triangles: { { number } } = {}
+
+	while #indices > 3 do
+		local earFound = false
+		local m = #indices
+
+		for i = 1, m do
+			local prev = indices[((i - 2) % m) + 1]
+			local cur = indices[i]
+			local nxt = indices[(i % m) + 1]
+
+			if cross2D(poly[prev], poly[cur], poly[nxt]) <= 0 then
+				continue
+			end
+
+			local pA, pB, pC = poly[prev], poly[cur], poly[nxt]
+			local isEar = true
+			for j = 1, m do
+				local idx = indices[j]
+				if idx == prev or idx == cur or idx == nxt then
+					continue
+				end
+				local p = poly[idx]
+				if (p - pA).Magnitude < COINCIDENT_EPS
+					or (p - pB).Magnitude < COINCIDENT_EPS
+					or (p - pC).Magnitude < COINCIDENT_EPS
+				then
+					continue
+				end
+				local d1 = cross2D(pA, pB, p)
+				local d2 = cross2D(pB, pC, p)
+				local d3 = cross2D(pC, pA, p)
+				if not ((d1 < 0) or (d2 < 0) or (d3 < 0)) or not ((d1 > 0) or (d2 > 0) or (d3 > 0)) then
+					isEar = false
+					break
+				end
+			end
+
+			if isEar then
+				table.insert(triangles, { prev, cur, nxt })
+				table.remove(indices, i)
+				earFound = true
+				break
+			end
+		end
+
+		if not earFound then
+			break
+		end
+	end
+
+	if #indices == 3 then
+		table.insert(triangles, { indices[1], indices[2], indices[3] })
+	end
+
+	return triangles
+end
 
 -- Returns the signed area of a 2D polygon (positive = CCW).
 local function signedArea(poly: { Vector2 }): number
@@ -85,4 +157,5 @@ return {
 	inset = inset,
 	ensureCCW = ensureCCW,
 	signedArea = signedArea,
+	earClipTriangulate = earClipTriangulate,
 }

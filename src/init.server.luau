@@ -1,26 +1,26 @@
 --!strict
 
 -- Frosting Plugin entry point.
--- Creates a ScreenGui overlay in CoreGui with a "Create Frosting" button.
+-- Creates a ScreenGui overlay in CoreGui with a "Create Frosting" button
+-- and a "Generate Test Cookies" button.
 
 local Selection = game:GetService("Selection")
 local CoreGui = game:GetService("CoreGui")
 
 local TopFaceExtractor = require(script.TopFaceExtractor)
 local PolygonInset = require(script.PolygonInset)
+local PolygonOffset = require(script.PolygonOffset)
+local PolygonClip = require(script.PolygonClip)
 local FrostingBuilder = require(script.FrostingBuilder)
+local TestCookieGenerator = require(script.TestCookieGenerator)
 
 -- Configuration ---------------------------------------------------------
 
--- Inset amount as a fraction of the mesh's XZ bounding-box diagonal.
 local INSET_FRACTION = 0.02
--- Extrude height as a fraction of the mesh's XZ bounding-box diagonal.
 local EXTRUDE_FRACTION = 0.06
--- A hole boundary must have at least this fraction of the outer area to be treated as a real hole.
-local HOLE_AREA_RATIO_MIN = 0.03
+local HOLE_AREA_RATIO_MIN = 0.002
 
--- Frosting appearance
-local FROSTING_COLOR = Color3.fromRGB(255, 105, 180)  -- pink
+local FROSTING_COLOR = Color3.fromRGB(255, 105, 180)
 local FROSTING_MATERIAL = Enum.Material.SmoothPlastic
 
 -- UI --------------------------------------------------------------------
@@ -33,7 +33,7 @@ gui.Parent = CoreGui
 
 local frame = Instance.new("Frame")
 frame.Name = "Panel"
-frame.Size = UDim2.new(0, 220, 0, 70)
+frame.Size = UDim2.new(0, 220, 0, 110)
 frame.Position = UDim2.new(0, 12, 0, 12)
 frame.BackgroundColor3 = Color3.fromRGB(36, 36, 36)
 frame.BorderSizePixel = 0
@@ -72,6 +72,22 @@ local btnCorner = Instance.new("UICorner")
 btnCorner.CornerRadius = UDim.new(0, 5)
 btnCorner.Parent = button
 
+local testButton = Instance.new("TextButton")
+testButton.Name = "GenerateTestCookiesButton"
+testButton.Size = UDim2.new(1, 0, 0, 28)
+testButton.BackgroundColor3 = Color3.fromRGB(233, 163, 86)
+testButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+testButton.Font = Enum.Font.GothamBold
+testButton.TextSize = 13
+testButton.Text = "Generate Test Cookies"
+testButton.BorderSizePixel = 0
+testButton.LayoutOrder = 2
+testButton.Parent = frame
+
+local testBtnCorner = Instance.new("UICorner")
+testBtnCorner.CornerRadius = UDim.new(0, 5)
+testBtnCorner.Parent = testButton
+
 local statusLabel = Instance.new("TextLabel")
 statusLabel.Name = "Status"
 statusLabel.Size = UDim2.new(1, 0, 0, 16)
@@ -81,7 +97,7 @@ statusLabel.Font = Enum.Font.Gotham
 statusLabel.TextSize = 11
 statusLabel.Text = "Select a cookie MeshPart"
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-statusLabel.LayoutOrder = 2
+statusLabel.LayoutOrder = 3
 statusLabel.Parent = frame
 
 -- Helpers ---------------------------------------------------------------
@@ -98,6 +114,57 @@ local function meshBBoxDiagonalXZ(part: MeshPart): number
 	return math.sqrt(size.X ^ 2 + size.Z ^ 2)
 end
 
+-- Frosting pipeline -----------------------------------------------------
+
+local function computeFrostingRegions(
+	island: TopFaceExtractor.Island,
+	insetAmount: number
+): { FrostingBuilder.FrostingRegion }
+	local regions: { FrostingBuilder.FrostingRegion } = {}
+
+	-- Inset the outer boundary (may produce multiple polygons)
+	local outerPoly = PolygonInset.ensureCCW(island.outer)
+	local outerInsetPolys = PolygonOffset.offset(outerPoly, insetAmount)
+
+	if #outerInsetPolys == 0 then
+		return regions
+	end
+
+	-- Compute hole outsets
+	local outerArea = math.abs(PolygonInset.signedArea(outerPoly))
+	local allHoleOutsetPolys: { { Vector2 } } = {}
+	for _, hp in island.holes do
+		local holeArea = math.abs(PolygonInset.signedArea(hp))
+		if holeArea / outerArea < HOLE_AREA_RATIO_MIN then
+			continue
+		end
+		local holePoly = PolygonInset.ensureCCW(hp)
+		local outsetPolys = PolygonOffset.offset(holePoly, -insetAmount)
+		for _, op in outsetPolys do
+			table.insert(allHoleOutsetPolys, op)
+		end
+	end
+
+	-- For each outer inset polygon, clip hole outsets to it
+	for _, outerInsetPoly in outerInsetPolys do
+		local clippedHoles: { { Vector2 } } = {}
+		for _, holeOutsetPoly in allHoleOutsetPolys do
+			local clipped = PolygonClip.intersection(holeOutsetPoly, outerInsetPoly)
+			for _, cp in clipped do
+				if math.abs(PolygonInset.signedArea(cp)) > 1e-6 then
+					table.insert(clippedHoles, PolygonInset.ensureCCW(cp))
+				end
+			end
+		end
+		table.insert(regions, {
+			outer = outerInsetPoly,
+			holes = clippedHoles,
+		})
+	end
+
+	return regions
+end
+
 -- Core logic ------------------------------------------------------------
 
 local function createFrosting(cookiePart: MeshPart)
@@ -111,26 +178,23 @@ local function createFrosting(cookiePart: MeshPart)
 		local insetAmount = diag * INSET_FRACTION
 		local extrudeHeight = diag * EXTRUDE_FRACTION
 
-		local outerPoly = PolygonInset.ensureCCW(extracted.polygon)
-		local outerInset = PolygonInset.inset(outerPoly, insetAmount)
+		setStatus("Computing offsets…")
 
-		setStatus("Building mesh…")
-		local buildResult
-
-		local outerArea = math.abs(PolygonInset.signedArea(outerPoly))
-		local holeOutsets: { { Vector2 } } = {}
-		for _, hp in extracted.holePolygons do
-			local holeArea = math.abs(PolygonInset.signedArea(hp))
-			if holeArea / outerArea >= HOLE_AREA_RATIO_MIN then
-				local holePoly = PolygonInset.ensureCCW(hp)
-				local holeOutset = PolygonInset.inset(holePoly, -insetAmount)
-				table.insert(holeOutsets, holeOutset)
+		local allRegions: { FrostingBuilder.FrostingRegion } = {}
+		for _, island in extracted.islands do
+			local islandRegions = computeFrostingRegions(island, insetAmount)
+			for _, r in islandRegions do
+				table.insert(allRegions, r)
 			end
 		end
 
-		buildResult = FrostingBuilder.build(
-			outerInset,
-			holeOutsets,
+		if #allRegions == 0 then
+			error("No valid frosting regions (cookie may be too thin for frosting)")
+		end
+
+		setStatus("Building mesh…")
+		local buildResult = FrostingBuilder.build(
+			allRegions,
 			extracted.topY,
 			extrudeHeight,
 			FROSTING_COLOR
@@ -140,7 +204,7 @@ local function createFrosting(cookiePart: MeshPart)
 		frostingPart.Name = cookiePart.Name .. "_Frosting"
 		frostingPart.Color = FROSTING_COLOR
 		frostingPart.Material = FROSTING_MATERIAL
-		frostingPart.CFrame = cookiePart.CFrame * CFrame.new(buildResult.meshCenterOffset)
+		frostingPart.CFrame = cookiePart.CFrame
 		frostingPart.Anchored = true
 		frostingPart.Parent = cookiePart.Parent
 
@@ -157,7 +221,7 @@ local function createFrosting(cookiePart: MeshPart)
 	end
 end
 
--- Button handler --------------------------------------------------------
+-- Button handlers -------------------------------------------------------
 
 button.MouseButton1Click:Connect(function()
 	local selected = Selection:Get()
@@ -178,6 +242,24 @@ button.MouseButton1Click:Connect(function()
 	end
 
 	createFrosting(part :: MeshPart)
+end)
+
+testButton.MouseButton1Click:Connect(function()
+	setStatus("Generating test cookies…")
+	testButton.Active = false
+
+	local ok, err = pcall(function()
+		TestCookieGenerator.generateAll()
+	end)
+
+	testButton.Active = true
+
+	if ok then
+		setStatus("Test cookies generated!", false)
+	else
+		setStatus("Error: " .. tostring(err), true)
+		warn("[FrostingPlugin]", err)
+	end
 end)
 
 -- Cleanup on plugin unload ----------------------------------------------

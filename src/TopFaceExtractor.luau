@@ -1,24 +1,31 @@
 --!strict
 
--- Reads a MeshPart's EditableMesh, identifies the top-facing polygon,
--- and returns an ordered list of 2D boundary vertices (X-Z plane) plus topY.
+-- Reads a MeshPart's EditableMesh, identifies the top-facing polygon(s),
+-- and returns one or more islands, each with an outer boundary and zero or
+-- more hole boundaries (all as 2D X-Z polygons), plus the shared topY.
 --
--- Handles split vertices (same position, different IDs) by merging by position.
+-- Multi-island support: disconnected cookie pieces are returned as separate
+-- islands.  Holes are assigned to their containing outer boundary via
+-- point-in-polygon containment tests.
 
 local AssetService = game:GetService("AssetService")
 local PolygonInset = require(script.Parent.PolygonInset)
+local PolygonOffset = require(script.Parent.PolygonOffset)
+
+export type Island = {
+	outer: { Vector2 },
+	holes: { { Vector2 } },
+}
 
 export type TopFaceResult = {
-	polygon: { Vector2 },
-	holePolygons: { { Vector2 } },
+	islands: { Island },
 	topY: number,
 }
 
 local NORMAL_UP_THRESHOLD = 0.7
 local Y_SNAP_TOLERANCE = 0.02
-local POSITION_SNAP = 1000 -- round to 3 decimal places for position merging
+local POSITION_SNAP = 1000
 
--- Round a position to a string key for vertex merging.
 local function posKey(pos: Vector3): string
 	local x = math.round(pos.X * POSITION_SNAP)
 	local y = math.round(pos.Y * POSITION_SNAP)
@@ -35,13 +42,9 @@ local function edgeKey(a: string, b: string): string
 end
 
 local function extract(meshPart: MeshPart): TopFaceResult
-	local em = AssetService:CreateEditableMeshAsync(
-		meshPart.MeshContent,
-		{ FixedSize = false }
-	)
+	local em = AssetService:CreateEditableMeshAsync(meshPart.MeshContent, { FixedSize = false })
 
-	-- 1. Build position-merge map: vertex ID → canonical position key.
-	--    Also store one representative position per key.
+	-- 1. Build position-merge map
 	local vidToPosKey: { [number]: string } = {}
 	local posKeyToPos: { [string]: Vector3 } = {}
 
@@ -54,32 +57,36 @@ local function extract(meshPart: MeshPart): TopFaceResult
 		end
 	end
 
-	-- 2. Find all upward-facing faces and determine topY.
+	-- 2. Find upward-facing faces, determine topY
 	local topFaceIds: { number } = {}
 	local maxY = -math.huge
 
 	for _, faceId in em:GetFaces() do
 		local verts = em:GetFaceVertices(faceId)
-		if #verts < 3 then continue end
-
+		if #verts < 3 then
+			continue
+		end
 		local p0 = em:GetPosition(verts[1])
 		local p1 = em:GetPosition(verts[2])
 		local p2 = em:GetPosition(verts[3])
 		local cross = (p1 - p0):Cross(p2 - p0)
-		if cross.Magnitude < 1e-8 then continue end
-
+		if cross.Magnitude < 1e-8 then
+			continue
+		end
 		if cross.Unit.Y >= NORMAL_UP_THRESHOLD then
 			table.insert(topFaceIds, faceId)
 			for _, vid in verts do
 				local y = em:GetPosition(vid).Y
-				if y > maxY then maxY = y end
+				if y > maxY then
+					maxY = y
+				end
 			end
 		end
 	end
 
 	assert(#topFaceIds > 0, "No upward-facing faces found on this MeshPart")
 
-	-- 3. Collect position keys that sit on topY.
+	-- 3. Collect top position keys
 	local topPosKeys: { [string]: boolean } = {}
 	for _, faceId in topFaceIds do
 		for _, vid in em:GetFaceVertices(faceId) do
@@ -90,9 +97,9 @@ local function extract(meshPart: MeshPart): TopFaceResult
 		end
 	end
 
-	-- 4. Find boundary edges using merged position keys.
+	-- 4. Boundary edges
 	local edgeCount: { [string]: number } = {}
-	local directedEdgeStore: { [string]: { string } } = {} -- ek -> {pkA, pkB}
+	local directedEdgeStore: { [string]: { string } } = {}
 
 	for _, faceId in topFaceIds do
 		local verts = em:GetFaceVertices(faceId)
@@ -111,7 +118,7 @@ local function extract(meshPart: MeshPart): TopFaceResult
 		end
 	end
 
-	-- 5. Build directed adjacency from boundary edges (count == 1).
+	-- 5. Directed adjacency from boundary edges
 	local directedEdges: { [string]: string } = {}
 	for ek, count in edgeCount do
 		if count == 1 then
@@ -120,16 +127,20 @@ local function extract(meshPart: MeshPart): TopFaceResult
 		end
 	end
 
-	-- 6. Walk all boundary chains.
+	-- 6. Walk boundary chains
 	local seen: { [string]: boolean } = {}
 	local chains: { { string } } = {}
 
 	for startPk, _ in directedEdges do
-		if seen[startPk] then continue end
+		if seen[startPk] then
+			continue
+		end
 		local chain: { string } = {}
 		local cur: string? = startPk
 		repeat
-			if cur == nil or seen[cur] then break end
+			if cur == nil or seen[cur] then
+				break
+			end
 			seen[cur] = true
 			table.insert(chain, cur)
 			cur = directedEdges[cur]
@@ -139,7 +150,7 @@ local function extract(meshPart: MeshPart): TopFaceResult
 		end
 	end
 
-	-- Try reversed direction if no chains found.
+	-- Try reversed direction if nothing found
 	if #chains == 0 then
 		local rev: { [string]: string } = {}
 		for ek, count in edgeCount do
@@ -150,11 +161,15 @@ local function extract(meshPart: MeshPart): TopFaceResult
 		end
 		seen = {}
 		for startPk, _ in rev do
-			if seen[startPk] then continue end
+			if seen[startPk] then
+				continue
+			end
 			local chain: { string } = {}
 			local cur: string? = startPk
 			repeat
-				if cur == nil or seen[cur] then break end
+				if cur == nil or seen[cur] then
+					break
+				end
 				seen[cur] = true
 				table.insert(chain, cur)
 				cur = rev[cur]
@@ -167,8 +182,12 @@ local function extract(meshPart: MeshPart): TopFaceResult
 
 	assert(#chains > 0, "No boundary chains found on top face")
 
-	-- 7. Convert all chains to Vector2 polygons, sort by area descending.
-	local chainPolygons: { { poly: { Vector2 }, area: number } } = {}
+	-- 7. Convert chains to Vector2 polygons
+	type ChainInfo = {
+		poly: { Vector2 },
+		area: number,
+	}
+	local chainInfos: { ChainInfo } = {}
 
 	for _, chain in chains do
 		local poly: { Vector2 } = {}
@@ -176,28 +195,102 @@ local function extract(meshPart: MeshPart): TopFaceResult
 			local pos = posKeyToPos[pk]
 			table.insert(poly, Vector2.new(pos.X, pos.Z))
 		end
-		table.insert(chainPolygons, {
+		table.insert(chainInfos, {
 			poly = poly,
 			area = math.abs(PolygonInset.signedArea(poly)),
 		})
 	end
 
-	table.sort(chainPolygons, function(a, b) return a.area > b.area end)
+	-- 8. Classify chains into islands using containment -----------------------
+	--    A chain contained by zero others → outer boundary of an island.
+	--    A chain contained by exactly one other → hole of that island.
+	--    A chain contained by N (even) others → outer boundary (nested island).
+	--    A chain contained by N (odd) others  → hole.
 
-	assert(#chainPolygons > 0, "No boundary chains found")
+	local nChains = #chainInfos
 
-	-- Largest = outer boundary; remaining = hole boundaries.
-	local outerPoly = chainPolygons[1].poly
-	local holePolygons: { { Vector2 } } = {}
-	for i = 2, #chainPolygons do
-		table.insert(holePolygons, chainPolygons[i].poly)
+	-- For each chain, pick a sample vertex and count how many other chains
+	-- contain that point.
+	local containedBy: { { number } } = {} -- containedBy[i] = list of chain indices that contain chain i
+	for i = 1, nChains do
+		containedBy[i] = {}
+	end
+
+	for i = 1, nChains do
+		local samplePt = chainInfos[i].poly[1]
+		for j = 1, nChains do
+			if i == j then
+				continue
+			end
+			if PolygonOffset.pointInPolygon(samplePt, chainInfos[j].poly) then
+				table.insert(containedBy[i], j)
+			end
+		end
+	end
+
+	-- Build islands: even nesting depth = outer, odd = hole
+	local islandMap: { [number]: Island } = {} -- outer chain index → Island
+	local holeAssignment: { [number]: number } = {} -- hole chain index → outer chain index
+
+	for i = 1, nChains do
+		local depth = #containedBy[i]
+		if depth % 2 == 0 then
+			-- Outer boundary
+			islandMap[i] = {
+				outer = PolygonInset.ensureCCW(chainInfos[i].poly),
+				holes = {},
+			}
+		end
+	end
+
+	for i = 1, nChains do
+		local depth = #containedBy[i]
+		if depth % 2 == 1 then
+			-- Hole: find its immediate parent (the containing chain with the
+			-- smallest area among those at depth-1 nesting).
+			local bestParent: number? = nil
+			local bestArea = math.huge
+			for _, parentIdx in containedBy[i] do
+				if #containedBy[parentIdx] == depth - 1 then
+					if chainInfos[parentIdx].area < bestArea then
+						bestArea = chainInfos[parentIdx].area
+						bestParent = parentIdx
+					end
+				end
+			end
+			if bestParent and islandMap[bestParent] then
+				table.insert(islandMap[bestParent].holes, chainInfos[i].poly)
+				holeAssignment[i] = bestParent
+			end
+		end
+	end
+
+	-- Collect islands into an array
+	local islands: { Island } = {}
+	for _, island in islandMap do
+		table.insert(islands, island)
+	end
+
+	-- Fallback: if the classification yielded nothing, use the legacy approach
+	-- (largest polygon = outer, rest = holes).
+	if #islands == 0 then
+		table.sort(chainInfos, function(a, b)
+			return a.area > b.area
+		end)
+		local fallbackIsland: Island = {
+			outer = PolygonInset.ensureCCW(chainInfos[1].poly),
+			holes = {},
+		}
+		for i = 2, nChains do
+			table.insert(fallbackIsland.holes, chainInfos[i].poly)
+		end
+		table.insert(islands, fallbackIsland)
 	end
 
 	em:Destroy()
 
 	return {
-		polygon = outerPoly,
-		holePolygons = holePolygons,
+		islands = islands,
 		topY = maxY,
 	}
 end
