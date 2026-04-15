@@ -118,63 +118,94 @@ local function extract(meshPart: MeshPart): TopFaceResult
 		end
 	end
 
-	-- 5. Directed adjacency from boundary edges
-	local directedEdges: { [string]: string } = {}
+	-- 5. Undirected adjacency from boundary edges
+	local adjacency: { [string]: { string } } = {}
 	for ek, count in edgeCount do
 		if count == 1 then
 			local edge = directedEdgeStore[ek]
-			directedEdges[edge[1]] = edge[2]
+			local a, b = edge[1], edge[2]
+			if not adjacency[a] then
+				adjacency[a] = {}
+			end
+			if not adjacency[b] then
+				adjacency[b] = {}
+			end
+			table.insert(adjacency[a], b)
+			table.insert(adjacency[b], a)
 		end
 	end
 
-	-- 6. Walk boundary chains
-	local seen: { [string]: boolean } = {}
+	-- 6. Walk boundary chains using undirected adjacency.
+	--    At junction vertices (degree > 2), use the leftmost-turn rule
+	--    (smallest CCW angle from incoming edge) so the walk stays on the
+	--    correct boundary loop instead of short-circuiting.
+	local function pickNext(
+		curPk: string,
+		prevPk: string?,
+		neighbors: { string },
+		usedEdges: { [string]: boolean }
+	): string?
+		-- Filter to unvisited-edge candidates
+		local cands: { string } = {}
+		for _, nb in neighbors do
+			local ek = edgeKey(curPk, nb)
+			if nb ~= prevPk and not usedEdges[ek] then
+				table.insert(cands, nb)
+			end
+		end
+		if #cands == 0 then return nil end
+		if #cands == 1 then return cands[1] end
+
+		-- Multiple candidates: pick leftmost turn (smallest CCW angle)
+		local curPos = posKeyToPos[curPk]
+		local inDir: Vector2
+		if prevPk then
+			local prevPos = posKeyToPos[prevPk]
+			inDir = Vector2.new(curPos.X - prevPos.X, curPos.Z - prevPos.Z)
+		else
+			local firstNb = posKeyToPos[cands[1]]
+			inDir = Vector2.new(firstNb.X - curPos.X, firstNb.Z - curPos.Z)
+		end
+		local inAngle = math.atan2(inDir.Y, inDir.X)
+
+		local best: string? = nil
+		local bestTurn = math.huge
+		for _, nb in cands do
+			local nbPos = posKeyToPos[nb]
+			local outDir = Vector2.new(nbPos.X - curPos.X, nbPos.Z - curPos.Z)
+			local outAngle = math.atan2(outDir.Y, outDir.X)
+			local turn = outAngle - inAngle + math.pi
+			turn = turn % (2 * math.pi)
+			if turn < bestTurn then
+				bestTurn = turn
+				best = nb
+			end
+		end
+		return best
+	end
+
+	local usedEdges: { [string]: boolean } = {}
 	local chains: { { string } } = {}
 
-	for startPk, _ in directedEdges do
-		if seen[startPk] then
-			continue
-		end
-		local chain: { string } = {}
-		local cur: string? = startPk
-		repeat
-			if cur == nil or seen[cur] then
-				break
-			end
-			seen[cur] = true
-			table.insert(chain, cur)
-			cur = directedEdges[cur]
-		until cur == startPk
-		if #chain >= 3 then
-			table.insert(chains, chain)
-		end
-	end
+	for startPk in adjacency do
+		local neighbors = adjacency[startPk]
+		for _, firstNb in neighbors do
+			local ek = edgeKey(startPk, firstNb)
+			if usedEdges[ek] then continue end
 
-	-- Try reversed direction if nothing found
-	if #chains == 0 then
-		local rev: { [string]: string } = {}
-		for ek, count in edgeCount do
-			if count == 1 then
-				local edge = directedEdgeStore[ek]
-				rev[edge[2]] = edge[1]
-			end
-		end
-		seen = {}
-		for startPk, _ in rev do
-			if seen[startPk] then
-				continue
-			end
-			local chain: { string } = {}
-			local cur: string? = startPk
-			repeat
-				if cur == nil or seen[cur] then
-					break
-				end
-				seen[cur] = true
+			local chain: { string } = { startPk }
+			usedEdges[ek] = true
+			local prev = startPk
+			local cur = firstNb
+			while cur ~= startPk do
 				table.insert(chain, cur)
-				cur = rev[cur]
-			until cur == startPk
-			if #chain >= 3 then
+				local nxt = pickNext(cur, prev, adjacency[cur], usedEdges)
+				if not nxt then break end
+				usedEdges[edgeKey(cur, nxt)] = true
+				prev = cur
+				cur = nxt
+			end
+			if #chain >= 3 and cur == startPk then
 				table.insert(chains, chain)
 			end
 		end

@@ -272,7 +272,9 @@ end
 
 local function extrudeProfile(profile: ShapeProfile, height: number): MeshPart
 	local em = AssetService:CreateEditableMesh()
-	local outer = profile.outer
+	-- Side wall winding assumes a CCW outer boundary (viewed from +Y). Shapes defined CW
+	-- (e.g. parametric hearts, hand-authored zigzags) get inverted side normals otherwise.
+	local outer = PolygonInset.ensureCCW(profile.outer)
 	local holes: { { Vector2 } } = profile.holes or {}
 	local nOuter = #outer
 
@@ -486,42 +488,20 @@ local function makeGear(): Shape
 end
 
 local function makeSnowflake(): Shape
+	-- Inward notch + tip per arm (12 verts). Any extra “side branch” points off the notch–tip
+	-- chord cross other arms and self-intersect, which breaks ear-clipping and corrupts the mesh.
 	local pts: { Vector2 } = {}
 	local nArms = 6
 	local armLen = COOKIE_RADIUS * 1.1
-	local armW = 0.25
-	local branchLen = armLen * 0.45
-	local branchW = 0.15
-	local branchPos = 0.55
+	local notchR = COOKIE_RADIUS * 0.26
 
 	for i = 0, nArms - 1 do
-		local baseAngle = 2 * math.pi * i / nArms
-		local nextAngle = 2 * math.pi * (i + 1) / nArms
-		local midAngle = (baseAngle + nextAngle) / 2
-
-		local cosA, sinA = math.cos(baseAngle), math.sin(baseAngle)
-		local perpX, perpY = -sinA, cosA
-
-		-- Right side of arm going outward
-		table.insert(pts, Vector2.new(armW * perpX, armW * perpY))
-		-- Right branch
-		local brPt = armLen * branchPos
-		local brAngle = baseAngle + math.pi / 6
-		table.insert(pts, Vector2.new(brPt * cosA + branchW * perpX, brPt * sinA + branchW * perpY))
-		table.insert(pts, Vector2.new(brPt * cosA + branchLen * math.cos(brAngle), brPt * sinA + branchLen * math.sin(brAngle)))
-		table.insert(pts, Vector2.new(brPt * cosA, brPt * sinA))
-		-- Left branch
-		local blAngle = baseAngle - math.pi / 6
-		table.insert(pts, Vector2.new(brPt * cosA + branchLen * math.cos(blAngle), brPt * sinA + branchLen * math.sin(blAngle)))
-		table.insert(pts, Vector2.new(brPt * cosA - branchW * perpX, brPt * sinA - branchW * perpY))
-		-- Tip
-		table.insert(pts, Vector2.new(armLen * cosA, armLen * sinA))
-		-- Left side going back
-		table.insert(pts, Vector2.new(armW * (-perpX), armW * (-perpY)))
-		-- Gap between arms
-		local gapR = armW * 1.5
-		table.insert(pts, Vector2.new(gapR * math.cos(midAngle), gapR * math.sin(midAngle)))
+		local th = 2 * math.pi * i / nArms
+		local notchBefore = th - math.pi / nArms
+		table.insert(pts, Vector2.new(notchR * math.cos(notchBefore), notchR * math.sin(notchBefore)))
+		table.insert(pts, Vector2.new(armLen * math.cos(th), armLen * math.sin(th)))
 	end
+
 	return { name = "Snowflake", profiles = { { outer = pts } } }
 end
 
@@ -550,14 +530,15 @@ end
 local function makeMaze(): Shape
 	local s = COOKIE_RADIUS * 1.3
 	local outer = rectProfile(0, 0, s * 2, s * 2)
-	local w = 0.2
+	local w = 0.22
+	-- Non-overlapping corridors only. (The previous layout had crossing slits; merged caps
+	-- then triangulated a self-intersecting boundary, corrupting the mesh.)
 	local holes = {
-		rectProfile(-s * 0.4, s * 0.35, s * 0.9, w),
-		rectProfile(s * 0.35, -s * 0.1, w, s * 1.1),
-		rectProfile(-s * 0.1, -s * 0.4, s * 0.7, w),
-		rectProfile(-s * 0.55, 0, w, s * 0.8),
-		rectProfile(s * 0.15, s * 0.55, s * 0.5, w),
-		rectProfile(-s * 0.3, -s * 0.6, s * 0.4, w),
+		rectProfile(0, s * 0.58, s * 1.55, w),
+		rectProfile(0, -s * 0.58, s * 1.55, w),
+		rectProfile(s * 0.48, 0, w, s * 0.72),
+		rectProfile(-s * 0.48, 0, w, s * 0.72),
+		rectProfile(0, 0, s * 0.55, w),
 	}
 	return { name = "Maze", profiles = { { outer = outer, holes = holes } } }
 end
@@ -579,68 +560,39 @@ local function makeNestedRing(): Shape
 end
 
 local function makeButterfly(): Shape
-	local pts: { Vector2 } = {}
-	local wingR = COOKIE_RADIUS * 0.9
-	local bodyW = 0.3
-	local nW = 20
-	-- Right wing (top)
-	for i = 0, nW do
-		local a = math.pi * 0.15 + (math.pi * 0.7) * i / nW
-		table.insert(pts, Vector2.new(wingR * math.cos(a) + bodyW, wingR * math.sin(a)))
-	end
-	-- Thin neck
-	table.insert(pts, Vector2.new(bodyW, -0.2))
-	-- Right wing (bottom)
-	for i = 0, nW do
-		local a = -math.pi * 0.15 - (math.pi * 0.7) * i / nW
-		table.insert(pts, Vector2.new(wingR * math.cos(a) + bodyW, wingR * math.sin(a)))
-	end
-	-- Bottom body
-	table.insert(pts, Vector2.new(bodyW, -wingR * 0.6))
-	table.insert(pts, Vector2.new(-bodyW, -wingR * 0.6))
-	-- Left wing (bottom)
-	for i = 0, nW do
-		local a = -math.pi + math.pi * 0.15 + (math.pi * 0.7) * i / nW
-		table.insert(pts, Vector2.new(wingR * math.cos(a) - bodyW, wingR * math.sin(a)))
-	end
-	-- Thin neck
-	table.insert(pts, Vector2.new(-bodyW, -0.2))
-	-- Left wing (top)
-	for i = 0, nW do
-		local a = math.pi - math.pi * 0.15 - (math.pi * 0.7) * i / nW
-		table.insert(pts, Vector2.new(wingR * math.cos(a) - bodyW, wingR * math.sin(a)))
-	end
-	-- Top body
-	table.insert(pts, Vector2.new(-bodyW, wingR * 0.6))
-	table.insert(pts, Vector2.new(bodyW, wingR * 0.6))
+	-- Simple closed outline (no self-intersections). The old path crossed itself and broke caps.
+	local R = COOKIE_RADIUS * 0.9
+	local bw = 0.4
+	local pts: { Vector2 } = {
+		Vector2.new(0, -R * 0.5),
+		Vector2.new(-R * 0.35, -R * 0.25),
+		Vector2.new(-R * 1.05, 0),
+		Vector2.new(-R * 0.35, R * 0.25),
+		Vector2.new(-bw, R * 0.45),
+		Vector2.new(bw, R * 0.45),
+		Vector2.new(R * 0.35, R * 0.25),
+		Vector2.new(R * 1.05, 0),
+		Vector2.new(R * 0.35, -R * 0.25),
+		Vector2.new(bw, -R * 0.5),
+	}
 	return { name = "Butterfly", profiles = { { outer = pts } } }
 end
 
 local function makeSpikeCircle(): Shape
-	local baseR = COOKIE_RADIUS * 0.7
-	local spikeLen = COOKIE_RADIUS * 0.7
-	local spikeW = 0.45
+	-- Valley on the base circle + tip per spike (16 verts for 8 spikes). The old layout mixed
+	-- off-circle spike sides with arc samples; those chords crossed other edges and corrupted caps.
 	local nSpikes = 8
+	local baseR = COOKIE_RADIUS * 0.72
+	local tipR = baseR + COOKIE_RADIUS * 0.65
 	local pts: { Vector2 } = {}
-	local spikeHalfAngle = math.asin(math.min(spikeW / baseR, 0.99))
-	local gapAngle = 2 * math.pi / nSpikes - 2 * spikeHalfAngle
-	local arcSteps = 4
 
 	for i = 0, nSpikes - 1 do
-		local center = 2 * math.pi * i / nSpikes
-		local cosC, sinC = math.cos(center), math.sin(center)
-		local perpX, perpY = -sinC, cosC
-
-		table.insert(pts, Vector2.new(baseR * cosC + spikeW * perpX, baseR * sinC + spikeW * perpY))
-		table.insert(pts, Vector2.new((baseR + spikeLen) * cosC, (baseR + spikeLen) * sinC))
-		table.insert(pts, Vector2.new(baseR * cosC - spikeW * perpX, baseR * sinC - spikeW * perpY))
-
-		local arcStart = center + spikeHalfAngle
-		for k = 1, arcSteps do
-			local aa = arcStart + gapAngle * k / (arcSteps + 1)
-			table.insert(pts, Vector2.new(baseR * math.cos(aa), baseR * math.sin(aa)))
-		end
+		local valleyAngle = 2 * math.pi * i / nSpikes - math.pi / nSpikes
+		table.insert(pts, Vector2.new(baseR * math.cos(valleyAngle), baseR * math.sin(valleyAngle)))
+		local tipAngle = 2 * math.pi * i / nSpikes
+		table.insert(pts, Vector2.new(tipR * math.cos(tipAngle), tipR * math.sin(tipAngle)))
 	end
+
 	return { name = "SpikeCircle", profiles = { { outer = pts } } }
 end
 

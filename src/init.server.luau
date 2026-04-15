@@ -6,6 +6,7 @@
 
 local Selection = game:GetService("Selection")
 local CoreGui = game:GetService("CoreGui")
+local CollectionService = game:GetService("CollectionService")
 
 local TopFaceExtractor = require(script.TopFaceExtractor)
 local PolygonInset = require(script.PolygonInset)
@@ -17,11 +18,23 @@ local TestCookieGenerator = require(script.TestCookieGenerator)
 -- Configuration ---------------------------------------------------------
 
 local INSET_FRACTION = 0.02
-local EXTRUDE_FRACTION = 0.06
+local EXTRUDE_FRACTION = 0.02
 local HOLE_AREA_RATIO_MIN = 0.002
 
 local FROSTING_COLOR = Color3.fromRGB(255, 105, 180)
+local FROSTING_ON_FROSTING_COLOR = Color3.fromRGB(0, 255, 0)
 local FROSTING_MATERIAL = Enum.Material.SmoothPlastic
+local FROSTING_TAG = "Frosting"
+
+-- Toolbar ---------------------------------------------------------------
+
+local toolbar = plugin:CreateToolbar("Frosting")
+local toggleButton = toolbar:CreateButton(
+	"ToggleFrosting",
+	"Toggle the Frosting plugin panel",
+	"rbxassetid://14978120386"
+)
+toggleButton.ClickableWhenViewportHidden = true
 
 -- UI --------------------------------------------------------------------
 
@@ -29,7 +42,15 @@ local gui = Instance.new("ScreenGui")
 gui.Name = "FrostingPluginGui"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Enabled = false
 gui.Parent = CoreGui
+
+toggleButton:SetActive(gui.Enabled)
+
+toggleButton.Click:Connect(function()
+	gui.Enabled = not gui.Enabled
+	toggleButton:SetActive(gui.Enabled)
+end)
 
 local frame = Instance.new("Frame")
 frame.Name = "Panel"
@@ -95,7 +116,7 @@ statusLabel.BackgroundTransparency = 1
 statusLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
 statusLabel.Font = Enum.Font.Gotham
 statusLabel.TextSize = 11
-statusLabel.Text = "Select a cookie MeshPart"
+statusLabel.Text = "Select one or more MeshParts"
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 statusLabel.LayoutOrder = 3
 statusLabel.Parent = frame
@@ -115,6 +136,59 @@ local function meshBBoxDiagonalXZ(part: MeshPart): number
 end
 
 -- Frosting pipeline -----------------------------------------------------
+
+-- PolygonClip.union has a W-A walk-direction bug that causes it to return the
+-- intersection instead of the union for partially-overlapping convex polygons.
+-- Work around it by also trying PolygonClip.intersection as a fallback, which
+-- due to the same bug returns the union for those cases.  An area check guards
+-- against accepting a bogus (too-small) result.
+local function tryMergeHoles(a: { Vector2 }, b: { Vector2 }): { Vector2 }?
+	local areaA = math.abs(PolygonInset.signedArea(a))
+	local areaB = math.abs(PolygonInset.signedArea(b))
+	local maxA = math.max(areaA, areaB)
+
+	local merged = PolygonClip.union(a, b)
+	if #merged > 0 then
+		local mp = PolygonInset.ensureCCW(merged[1])
+		if math.abs(PolygonInset.signedArea(mp)) >= maxA * 0.9 then
+			return mp
+		end
+	end
+
+	merged = PolygonClip.intersection(a, b)
+	if #merged > 0 then
+		local mp = PolygonInset.ensureCCW(merged[1])
+		if math.abs(PolygonInset.signedArea(mp)) >= maxA * 0.9 then
+			return mp
+		end
+	end
+
+	return nil
+end
+
+local function mergeOverlappingPolygons(polys: { { Vector2 } }): { { Vector2 } }
+	local result: { { Vector2 } } = {}
+	for _, p in polys do
+		table.insert(result, PolygonInset.ensureCCW(p))
+	end
+	local changed = true
+	while changed do
+		changed = false
+		for i = 1, #result do
+			for j = i + 1, #result do
+				local mp = tryMergeHoles(result[i], result[j])
+				if mp then
+					result[i] = mp
+					table.remove(result, j)
+					changed = true
+					break
+				end
+			end
+			if changed then break end
+		end
+	end
+	return result
+end
 
 local function computeFrostingRegions(
 	island: TopFaceExtractor.Island,
@@ -145,6 +219,8 @@ local function computeFrostingRegions(
 		end
 	end
 
+	allHoleOutsetPolys = mergeOverlappingPolygons(allHoleOutsetPolys)
+
 	-- For each outer inset polygon, clip hole outsets to it
 	for _, outerInsetPoly in outerInsetPolys do
 		local clippedHoles: { { Vector2 } } = {}
@@ -167,9 +243,12 @@ end
 
 -- Core logic ------------------------------------------------------------
 
-local function createFrosting(cookiePart: MeshPart)
-	setStatus("Reading mesh…")
-	button.Active = false
+local function createFrostingForPart(cookiePart: MeshPart, prefix: string): (boolean, any)
+	setStatus(prefix .. 'Reading mesh for "' .. cookiePart.Name .. '"…')
+
+	local color = if CollectionService:HasTag(cookiePart, FROSTING_TAG)
+		then FROSTING_ON_FROSTING_COLOR
+		else FROSTING_COLOR
 
 	local ok, result = pcall(function()
 		local extracted = TopFaceExtractor.extract(cookiePart)
@@ -178,7 +257,7 @@ local function createFrosting(cookiePart: MeshPart)
 		local insetAmount = diag * INSET_FRACTION
 		local extrudeHeight = diag * EXTRUDE_FRACTION
 
-		setStatus("Computing offsets…")
+		setStatus(prefix .. "Computing offsets…")
 
 		local allRegions: { FrostingBuilder.FrostingRegion } = {}
 		for _, island in extracted.islands do
@@ -192,32 +271,31 @@ local function createFrosting(cookiePart: MeshPart)
 			error("No valid frosting regions (cookie may be too thin for frosting)")
 		end
 
-		setStatus("Building mesh…")
+		setStatus(prefix .. "Building mesh…")
 		local buildResult = FrostingBuilder.build(
 			allRegions,
 			extracted.topY,
 			extrudeHeight,
-			FROSTING_COLOR
+			color
 		)
 
 		local frostingPart = buildResult.meshPart
 		frostingPart.Name = cookiePart.Name .. "_Frosting"
-		frostingPart.Color = FROSTING_COLOR
+		frostingPart.Color = color
 		frostingPart.Material = FROSTING_MATERIAL
 		frostingPart.CFrame = cookiePart.CFrame
 		frostingPart.Anchored = true
 		frostingPart.Parent = cookiePart.Parent
+		CollectionService:AddTag(frostingPart, FROSTING_TAG)
 
 		return frostingPart
 	end)
 
-	button.Active = true
-
 	if ok then
-		setStatus("Done! Frosting created.", false)
+		return true, result
 	else
-		setStatus("Error: " .. tostring(result), true)
-		warn("[FrostingPlugin]", result)
+		warn("[FrostingPlugin]", cookiePart.Name, result)
+		return false, cookiePart.Name .. ": " .. tostring(result)
 	end
 end
 
@@ -226,22 +304,52 @@ end
 button.MouseButton1Click:Connect(function()
 	local selected = Selection:Get()
 
-	if #selected == 0 then
-		setStatus("Nothing selected.", true)
-		return
+	local meshParts: { MeshPart } = {}
+	for _, obj in selected do
+		if obj:IsA("MeshPart") then
+			table.insert(meshParts, obj :: MeshPart)
+		end
 	end
-	if #selected > 1 then
-		setStatus("Select exactly one MeshPart.", true)
+
+	if #meshParts == 0 then
+		setStatus("No MeshParts selected.", true)
 		return
 	end
 
-	local part = selected[1]
-	if not part:IsA("MeshPart") then
-		setStatus("Selection must be a MeshPart.", true)
-		return
+	button.Active = false
+	local succeeded, failed = 0, 0
+	local errors: { string } = {}
+	local newFrostingParts: { Instance } = {}
+
+	for i, part in meshParts do
+		local prefix = if #meshParts > 1
+			then string.format("[%d/%d] ", i, #meshParts)
+			else ""
+		local ok, result = createFrostingForPart(part, prefix)
+		if ok then
+			succeeded += 1
+			table.insert(newFrostingParts, result :: Instance)
+		else
+			failed += 1
+			if result then table.insert(errors, result :: string) end
+		end
 	end
 
-	createFrosting(part :: MeshPart)
+	if #newFrostingParts > 0 then
+		Selection:Set(newFrostingParts)
+	end
+
+	button.Active = true
+
+	if failed == 0 then
+		local noun = if succeeded == 1 then "frosting" else "frostings"
+		setStatus(string.format("Done! %d %s created.", succeeded, noun), false)
+	else
+		setStatus(string.format("%d succeeded, %d failed.", succeeded, failed), true)
+		for _, e in errors do
+			warn("[FrostingPlugin]", e)
+		end
+	end
 end)
 
 testButton.MouseButton1Click:Connect(function()

@@ -318,7 +318,34 @@ local function difference(subject: { Vector2 }, clip: { Vector2 }): { { Vector2 
 	return waWalk(sAug, cAug, isects, false, false)
 end
 
+--- Returns the union of `subject` and `clip`.
+--- If the polygons don't overlap at all, returns an empty table (caller must
+--- keep both as-is).
+local function union(subject: { Vector2 }, clip: { Vector2 }): { { Vector2 } }
+	subject = PolygonInset.ensureCCW(subject)
+	clip = PolygonInset.ensureCCW(clip)
+
+	local isects = findIntersections(subject, clip)
+
+	if #isects == 0 then
+		if PolygonOffset.pointInPolygon(subject[1], clip) then
+			return { clip }
+		end
+		if PolygonOffset.pointInPolygon(clip[1], subject) then
+			return { subject }
+		end
+		return {} -- disjoint; caller keeps both polygons separate
+	end
+
+	local sAug = buildAugmented(subject, isects, "sEdge", "tS")
+	local cAug = buildAugmented(clip, isects, "cEdge", "tC")
+	linkPartners(sAug, cAug, isects)
+
+	return waWalk(sAug, cAug, isects, false, true)
+end
+
 return {
 	intersection = intersection,
 	difference = difference,
+	union = union,
 }

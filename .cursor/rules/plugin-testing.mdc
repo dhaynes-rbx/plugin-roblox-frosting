@@ -8,13 +8,4 @@ alwaysApply: true
 After every rebuild, test using the Roblox Studio MCP server. Never skip this loop.
 
 ## Steps
-
-1. Use the MCP server to run the frosting generator on **every MeshPart** in the scene.
-2. Take a screenshot of each resulting mesh via the MCP server.
-3. Analyze each screenshot — verify all of the following:
-   - A visible flat border ring surrounds the raised center
-   - The raised center (extruded top) has no missing or inverted faces
-   - The frosting sits flush on the cookie surface (no gaps or z-fighting)
-   - No geometry artifacts (overlapping verts, degenerate triangles)
-4. If **any** mesh fails visual inspection, do NOT stop. Identify the issue, fix the code, rebuild, and re-test every mesh from scratch.
-5. Only mark a change complete when all meshes pass.
+The first time this rule is run, ask clarifying questions about what type of steps should be taken, and then update this rule with the response.

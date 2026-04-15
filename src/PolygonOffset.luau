@@ -385,10 +385,14 @@ local function offset(originalPoly: { Vector2 }, distance: number): { { Vector2 
 			continue
 		end
 
-		-- Reject tiny fragments at sharp tips (smaller than a 2×distance square)
-		local minArea = distance * distance * 4
-		if area < minArea then
-			continue
+		-- Reject tiny inset fragments only (positive distance). For negative offsets
+		-- (hole outsets) minArea used |distance|² and dropped thin but valid rings
+		-- on SwissCheese / Maze, causing missing hole cut-outs in frosting.
+		if distance > 0 then
+			local minArea = distance * distance * 4
+			if area < minArea then
+				continue
+			end
 		end
 
 		-- Reject inset cycles whose area exceeds the original (inverted tiny regions)
