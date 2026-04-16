@@ -1,8 +1,6 @@
 ---
-description: After every code change, rebuild the plugin into the Roblox Plugins folder
 alwaysApply: true
 ---
-
 # Plugin Build
 
 After every code change, run the Rojo build command to deploy the plugin.
