@@ -356,8 +356,13 @@ local function buildRegion(
 		table.insert(outerCapVids, em:AddVertex(Vector3.new(p.X, capY, p.Y)))
 	end
 
-	-- Hole boundary vertices
-	local holeOutsets = region.holes
+	-- Merge overlapping holes up front so both side walls and cap use the same
+	-- clean geometry.  Without this, two overlapping hole polygons would each
+	-- get their own inner side walls, causing wall quads to cross through the
+	-- shared open space and appear as floating geometry inside the holes.
+	local holeOutsets = unionOverlappingHoles(region.holes)
+
+	-- Hole boundary vertices: rim, wall-top, cap (separated for normals)
 	local allHoleRimVids: { { number } } = {}
 	local allHoleWallTopVids: { { number } } = {}
 	local allHoleCapVids: { { number } } = {}
@@ -382,7 +387,7 @@ local function buildRegion(
 		addTri(outerRimVids[i2], outerWallTopVids[i], outerWallTopVids[i2])
 	end
 
-	-- Inner side walls for each hole
+	-- Inner side walls for each hole (uses merged holeOutsets)
 	for h, holePoly in holeOutsets do
 		local nHole = #holePoly
 		local rimVids = allHoleRimVids[h]
@@ -401,23 +406,7 @@ local function buildRegion(
 			addTri(outerCapVids[tri[3]], outerCapVids[tri[2]], outerCapVids[tri[1]])
 		end
 	else
-		-- Union overlapping holes so bridge-merge never creates
-		-- self-intersecting polygons from crossing hole boundaries.
-		local capHoles = unionOverlappingHoles(holeOutsets)
-
-		local capHoleVids: { { number } } = {}
-		for h, hp in capHoles do
-			local vids: { number } = {}
-			for _, p in hp do
-				table.insert(vids, em:AddVertex(Vector3.new(p.X, capY, p.Y)))
-			end
-			capHoleVids[h] = vids
-		end
-
-		-- Bridge-merge each cap-hole into the outer polygon.
-		-- Use a queue: if a hole has no non-crossing bridge (blocked by
-		-- previously merged holes), push it to the back and retry after
-		-- other holes open up clear paths.
+		-- holeOutsets is already merged; reuse allHoleCapVids for the cap.
 		local mergedPoly: { Vector2 } = {}
 		local mergedVids: { number } = {}
 		for i, p in outerInset do
@@ -426,7 +415,7 @@ local function buildRegion(
 		end
 
 		local queue: { number } = {}
-		for h = 1, #capHoles do
+		for h = 1, #holeOutsets do
 			table.insert(queue, h)
 		end
 
@@ -435,13 +424,12 @@ local function buildRegion(
 		while #queue > 0 and retries < maxRetries do
 			local h = queue[1]
 			table.remove(queue, 1)
-			-- Build a list of other unmerged holes for crossing checks
 			local others: { { Vector2 } } = {}
 			for _, oh in queue do
-				table.insert(others, capHoles[oh])
+				table.insert(others, holeOutsets[oh])
 			end
 			local newP, newV, ok = mergeHoleVids(
-				mergedPoly, mergedVids, capHoles[h], capHoleVids[h], others
+				mergedPoly, mergedVids, holeOutsets[h], allHoleCapVids[h], others
 			)
 			if ok then
 				mergedPoly = newP
@@ -453,7 +441,7 @@ local function buildRegion(
 			end
 		end
 
-		local earTris = earClipTriangulate(mergedPoly, capHoles)
+		local earTris = earClipTriangulate(mergedPoly, holeOutsets)
 		for _, tri in earTris do
 			addTri(mergedVids[tri[3]], mergedVids[tri[2]], mergedVids[tri[1]])
 		end

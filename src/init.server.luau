@@ -232,6 +232,10 @@ local function computeFrostingRegions(
 				end
 			end
 		end
+		-- Clipping a concave merged polygon can split it back into multiple
+		-- pieces; merge those again so buildRegion never sees overlapping holes
+		-- (which would cause side-wall geometry to cross inside open hole space).
+		clippedHoles = mergeOverlappingPolygons(clippedHoles)
 		table.insert(regions, {
 			outer = outerInsetPoly,
 			holes = clippedHoles,
