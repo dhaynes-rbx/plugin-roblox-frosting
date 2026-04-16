@@ -5,11 +5,15 @@ alwaysApply: true
 
 # Plugin Build
 
-After every code change, run the Rojo build command to deploy the plugin:
+After every code change, run the Rojo build command to deploy the plugin.
+
+Use the following command:
 
 ```bash
-rojo build default.project.json --output ~/Documents/Roblox/Plugins/frosting.rbxmx
+rojo build --plugin frosting.rbxmx
 ```
+
+Rojo will handle placing the plugin in the correct location for your operating system.
 
 Do this before any testing step. If Rojo is not installed, install it first:
 
