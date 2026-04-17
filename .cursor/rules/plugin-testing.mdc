@@ -8,4 +8,12 @@ alwaysApply: true
 After every rebuild, test using the Roblox Studio MCP server. Never skip this loop.
 
 ## Steps
-The first time this rule is run, ask clarifying questions about what type of steps should be taken, and then update this rule with the response.
+
+Run these after every rebuild:
+
+1. `list_roblox_studios` to confirm a Studio instance is connected; pick one with `set_active_studio` if needed. If none is connected, ask the user to launch Studio with the plugin loaded before continuing.
+2. Generate test cookies via `execute_luau` (click the "Generate Test Cookies" button, or invoke `TestCookieGenerator.generateAll()` directly).
+3. For each test cookie: select it via `execute_luau` and trigger the "Create Frosting" button (or call the pipeline directly). Verify no errors in the Output.
+4. For at least one cookie of each class (simple, multi-hole, multi-island), repeatedly apply Create Frosting to the most recent frosting MeshPart. Confirm the top surface shrinks each layer and the pipeline gracefully reports "no more frosting possible" when the top is fully eroded.
+5. Capture screenshots via `screen_capture` at key stages (base cookies generated, single frosting applied, stacked frostings) and confirm visually that geometry looks correct.
+6. Read `get_console_output` to verify no `[FrostingPlugin]` warnings were emitted.
