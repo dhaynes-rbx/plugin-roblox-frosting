@@ -339,6 +339,42 @@ local function makeComb(): Shape
 end
 
 --------------------------------------------------------------------------------
+-- Geometry helpers
+--------------------------------------------------------------------------------
+
+-- Proper segment-segment intersection test (returns true if interiors cross).
+local function segsCross(p1: Vector2, p2: Vector2, p3: Vector2, p4: Vector2): boolean
+	local d1 = p2 - p1
+	local d2 = p4 - p3
+	local denom = d1.X * d2.Y - d1.Y * d2.X
+	if math.abs(denom) < 1e-12 then
+		return false
+	end
+	local d = p3 - p1
+	local t = (d.X * d2.Y - d.Y * d2.X) / denom
+	local u = (d.X * d1.Y - d.Y * d1.X) / denom
+	local EPS = 1e-6
+	return t > EPS and t < 1 - EPS and u > EPS and u < 1 - EPS
+end
+
+-- Ray-casting point-in-polygon test.
+local function pointInPolygon(point: Vector2, poly: { Vector2 }): boolean
+	local n = #poly
+	local inside = false
+	local px, py = point.X, point.Y
+	local j = n
+	for i = 1, n do
+		local xi, yi = poly[i].X, poly[i].Y
+		local xj, yj = poly[j].X, poly[j].Y
+		if ((yi > py) ~= (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi) then
+			inside = not inside
+		end
+		j = i
+	end
+	return inside
+end
+
+--------------------------------------------------------------------------------
 -- Extrusion: 2D profile → flat-topped EditableMesh → MeshPart
 --------------------------------------------------------------------------------
 
@@ -431,56 +467,122 @@ local function extrudeProfile(profile: ShapeProfile, height: number): MeshPart
 		local mergedTopVids: { number } = table.clone(outerCapTopVids)
 		local mergedBotVids: { number } = table.clone(outerCapBotVids)
 
-		for h, holePoly in holes do
+		-- Crossing-safe bridge merge with retry queue.  Dense hole
+		-- layouts (Honeycomb) produce crossing bridges under naive
+		-- nearest-pair, causing ear-clip to fill holes with cap faces.
+		local queue: { number } = {}
+		for h = 1, #holes do
+			table.insert(queue, h)
+		end
+
+		local maxRetries = #queue * #queue
+		local retries = 0
+		while #queue > 0 and retries < maxRetries do
+			local h = queue[1]
+			table.remove(queue, 1)
+			local holePoly = holes[h]
 			local nh = #holePoly
 			local nm = #mergedPoly
-			-- Naive nearest-pair bridge.  We explicitly do NOT adopt the
-			-- crossing-safe algorithm used by FrostingBuilder.mergeHoleVids
-			-- here: the downstream pipeline re-extracts the top face via
-			-- TopFaceExtractor and re-merges holes with the production
-			-- logic, so this generator only needs to produce a mesh that is
-			-- topologically walkable by TopFaceExtractor.  Swapping in
-			-- crossing-safe bridges here regresses Maze (multi-hole layouts
-			-- that depend on specific bridge chaining to keep all 5 hole
-			-- boundaries distinct after triangulation).
-			local bestDist = math.huge
-			local bridgeIdx, holeStartIdx = 1, 1
+
+			local candidates: { { mi: number, hi: number, dist: number } } = {}
 			for mi = 1, nm do
 				for hi = 1, nh do
-					local d = (mergedPoly[mi] - holePoly[hi]).Magnitude
-					if d < bestDist then
-						bestDist = d
-						bridgeIdx = mi
-						holeStartIdx = hi
+					table.insert(candidates, { mi = mi, hi = hi, dist = (mergedPoly[mi] - holePoly[hi]).Magnitude })
+				end
+			end
+			table.sort(candidates, function(a, b)
+				return a.dist < b.dist
+			end)
+
+			local bridgeIdx: number? = nil
+			local holeStartIdx: number? = nil
+			for _, cand in candidates do
+				local bp = mergedPoly[cand.mi]
+				local hp = holePoly[cand.hi]
+				local valid = true
+				for i = 1, nm do
+					local i2 = (i % nm) + 1
+					if i == cand.mi or i2 == cand.mi then continue end
+					if segsCross(bp, hp, mergedPoly[i], mergedPoly[i2]) then
+						valid = false
+						break
 					end
+				end
+				if valid then
+					for i = 1, nh do
+						local i2 = (i % nh) + 1
+						if i == cand.hi or i2 == cand.hi then continue end
+						if segsCross(bp, hp, holePoly[i], holePoly[i2]) then
+							valid = false
+							break
+						end
+					end
+				end
+				if valid then
+					for _, oh in queue do
+						local ohPoly = holes[oh]
+						local noh = #ohPoly
+						for i = 1, noh do
+							local i2 = (i % noh) + 1
+							if segsCross(bp, hp, ohPoly[i], ohPoly[i2]) then
+								valid = false
+								break
+							end
+						end
+						if not valid then break end
+					end
+				end
+				-- Reject bridges whose midpoint falls inside an unmerged
+				-- hole.  segsCross misses vertex-grazing cases where the
+				-- bridge passes through a hole vertex without crossing
+				-- any edge interior (Honeycomb center-to-outer bridge).
+				if valid then
+					local mid = (bp + hp) * 0.5
+					for _, oh in queue do
+						if pointInPolygon(mid, holes[oh]) then
+							valid = false
+							break
+						end
+					end
+				end
+				if valid then
+					bridgeIdx = cand.mi
+					holeStartIdx = cand.hi
+					break
 				end
 			end
 
-			local newPoly: { Vector2 } = {}
-			local newTopV: { number } = {}
-			local newBotV: { number } = {}
-			for i = 1, bridgeIdx do
-				table.insert(newPoly, mergedPoly[i])
-				table.insert(newTopV, mergedTopVids[i])
-				table.insert(newBotV, mergedBotVids[i])
+			if bridgeIdx and holeStartIdx then
+				local newPoly: { Vector2 } = {}
+				local newTopV: { number } = {}
+				local newBotV: { number } = {}
+				for i = 1, bridgeIdx do
+					table.insert(newPoly, mergedPoly[i])
+					table.insert(newTopV, mergedTopVids[i])
+					table.insert(newBotV, mergedBotVids[i])
+				end
+				for k = 0, nh do
+					local idx = ((holeStartIdx - 1 - k) % nh) + 1
+					table.insert(newPoly, holePoly[idx])
+					table.insert(newTopV, allHoleCapTopVids[h][idx])
+					table.insert(newBotV, allHoleCapBotVids[h][idx])
+				end
+				table.insert(newPoly, mergedPoly[bridgeIdx])
+				table.insert(newTopV, mergedTopVids[bridgeIdx])
+				table.insert(newBotV, mergedBotVids[bridgeIdx])
+				for i = bridgeIdx + 1, nm do
+					table.insert(newPoly, mergedPoly[i])
+					table.insert(newTopV, mergedTopVids[i])
+					table.insert(newBotV, mergedBotVids[i])
+				end
+				mergedPoly = newPoly
+				mergedTopVids = newTopV
+				mergedBotVids = newBotV
+				retries = 0
+			else
+				table.insert(queue, h)
+				retries += 1
 			end
-			for k = 0, nh do
-				local idx = ((holeStartIdx - 1 - k) % nh) + 1
-				table.insert(newPoly, holePoly[idx])
-				table.insert(newTopV, allHoleCapTopVids[h][idx])
-				table.insert(newBotV, allHoleCapBotVids[h][idx])
-			end
-			table.insert(newPoly, mergedPoly[bridgeIdx])
-			table.insert(newTopV, mergedTopVids[bridgeIdx])
-			table.insert(newBotV, mergedBotVids[bridgeIdx])
-			for i = bridgeIdx + 1, nm do
-				table.insert(newPoly, mergedPoly[i])
-				table.insert(newTopV, mergedTopVids[i])
-				table.insert(newBotV, mergedBotVids[i])
-			end
-			mergedPoly = newPoly
-			mergedTopVids = newTopV
-			mergedBotVids = newBotV
 		end
 
 		earClipCap(mergedPoly, mergedTopVids, true)

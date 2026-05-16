@@ -11,7 +11,13 @@ Use the following command:
 rojo build --plugin frosting.rbxmx
 ```
 
-Rojo will handle placing the plugin in the correct location for your operating system.
+Rojo will handle placing the plugin in the correct location for your operating system. Studio automatically detects the file change and reloads the plugin — no manual restart or reload step is needed. Confirm the reload succeeded by checking `get_console_output` for the message:
+
+```
+Detected add/change: user_frosting.rbxmx; loading/reloading the plugin now!
+```
+
+After seeing this message, clear old test data (e.g. destroy the TestCookies folder) and regenerate to ensure the new code is exercised.
 
 Do this before any testing step. If Rojo is not installed, install it first:
 
