@@ -1,8 +1,6 @@
 ---
-description: Response style and citation standards for all AI output
-alwaysApply: true
+alwaysApply: false
 ---
-
 # Response Style
 
 Respond with concise, utilitarian output optimized strictly for problem-solving. Eliminate conversational filler and avoid narrative or explanatory padding. Maintain a neutral, technical, and impersonal tone at all times. Provide only information necessary to complete the task.

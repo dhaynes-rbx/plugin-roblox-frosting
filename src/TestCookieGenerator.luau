@@ -36,6 +36,73 @@ local function rectProfile(cx: number, cz: number, w: number, h: number): { Vect
 	}
 end
 
+local function diamondProfile(cx: number, cz: number, w: number, h: number): { Vector2 }
+	local hw, hh = w / 2, h / 2
+	return {
+		Vector2.new(cx, cz - hh),
+		Vector2.new(cx + hw, cz),
+		Vector2.new(cx, cz + hh),
+		Vector2.new(cx - hw, cz),
+	}
+end
+
+local function regularPolygonProfile(
+	cx: number,
+	cz: number,
+	r: number,
+	n: number,
+	rotation: number?
+): { Vector2 }
+	local rot = rotation or 0
+	local pts: { Vector2 } = {}
+	for i = 0, n - 1 do
+		local a = rot + 2 * math.pi * i / n
+		table.insert(pts, Vector2.new(cx + r * math.cos(a), cz + r * math.sin(a)))
+	end
+	return pts
+end
+
+local function starProfileAt(
+	cx: number,
+	cz: number,
+	rOuter: number,
+	rInner: number,
+	nPoints: number,
+	rotation: number?
+): { Vector2 }
+	local rot = rotation or math.pi / 2
+	local pts: { Vector2 } = {}
+	for i = 0, nPoints * 2 - 1 do
+		local a = rot + 2 * math.pi * i / (nPoints * 2)
+		local r = if i % 2 == 0 then rOuter else rInner
+		table.insert(pts, Vector2.new(cx + r * math.cos(a), cz + r * math.sin(a)))
+	end
+	return pts
+end
+
+local function plusProfile(
+	cx: number,
+	cz: number,
+	armHalfLen: number,
+	armHalfWidth: number
+): { Vector2 }
+	local L, W = armHalfLen, armHalfWidth
+	return {
+		Vector2.new(cx - W, cz - L),
+		Vector2.new(cx + W, cz - L),
+		Vector2.new(cx + W, cz - W),
+		Vector2.new(cx + L, cz - W),
+		Vector2.new(cx + L, cz + W),
+		Vector2.new(cx + W, cz + W),
+		Vector2.new(cx + W, cz + L),
+		Vector2.new(cx - W, cz + L),
+		Vector2.new(cx - W, cz + W),
+		Vector2.new(cx - L, cz + W),
+		Vector2.new(cx - L, cz - W),
+		Vector2.new(cx - W, cz - W),
+	}
+end
+
 --------------------------------------------------------------------------------
 -- Shape generators: each returns { profiles = { {outer, holes?} }, name }
 -- `outer` is { Vector2 } CCW, `holes` is optional { { Vector2 } }.
@@ -50,6 +117,11 @@ type ShapeProfile = {
 type Shape = {
 	name: string,
 	profiles: { ShapeProfile },
+	-- Multi-profile shapes where the author has already laid the islands out in
+	-- non-overlapping local coordinates (archipelago-style). Opts out of the
+	-- default per-profile X offset that is used to visually separate concentric
+	-- profiles like NestedRing.
+	noOffset: boolean?,
 }
 
 local function makeCircle(): Shape
@@ -362,6 +434,15 @@ local function extrudeProfile(profile: ShapeProfile, height: number): MeshPart
 		for h, holePoly in holes do
 			local nh = #holePoly
 			local nm = #mergedPoly
+			-- Naive nearest-pair bridge.  We explicitly do NOT adopt the
+			-- crossing-safe algorithm used by FrostingBuilder.mergeHoleVids
+			-- here: the downstream pipeline re-extracts the top face via
+			-- TopFaceExtractor and re-merges holes with the production
+			-- logic, so this generator only needs to produce a mesh that is
+			-- topologically walkable by TopFaceExtractor.  Swapping in
+			-- crossing-safe bridges here regresses Maze (multi-hole layouts
+			-- that depend on specific bridge chaining to keep all 5 hole
+			-- boundaries distinct after triangulation).
 			local bestDist = math.huge
 			local bridgeIdx, holeStartIdx = 1, 1
 			for mi = 1, nm do
@@ -596,6 +677,401 @@ local function makeSpikeCircle(): Shape
 	return { name = "SpikeCircle", profiles = { { outer = pts } } }
 end
 
+--------------------------------------------------------------------------------
+-- Synthesized edge-case shapes (Phase 1 step 6).
+--
+-- Each shape targets a specific class of failure observed in the stack sweep:
+--   Dumbbell       - stress the pinch-to-waist geometry (cf. Figure8 passes
+--                     through 1→2 split; Dumbbell keeps a narrow body with
+--                     minor-axis close to 2*inset).
+--   TightHolePair  - two holes whose gap is about 2*inset, isolating the
+--                     hole-hole merge threshold responsible for SwissCheese L1.
+--   HoleNearEdge   - single hole ~2*inset from the outer boundary, isolating
+--                     the hole-outer abutment failure in arrangementSubtract.
+--   PlusSign       - thicker + cross (arms at COOKIE_RADIUS*0.55 width) to
+--                     contrast with ThinCross (arm 0.18); verifies whether
+--                     ThinCross F6 is an arm-width threshold or a topology bug.
+--   SharpChevron   - single V with interior angle <= 20° at the hinge, to
+--                     isolate the acute-angle sharpening path that Heart L6+
+--                     and Star L6 exercise but mix with other concerns.
+--   NestedHoles    - outer ring + inside that ring a second island with its
+--                     own hole (2 profiles). Stresses the multi-island
+--                     topology classification in PolygonNesting.
+--   ScaleSweep     - same Comb-ish geometry at 3 sizes (small 0.5*, medium 1*,
+--                     large 1.6*); inset is computed from cookie diagonal so
+--                     the relative inset is constant while absolute arm width
+--                     varies, isolating scale-dependent thresholds.
+--------------------------------------------------------------------------------
+
+local function makeDumbbell(): Shape
+	-- Two circles (r=1.2) centered at x=±1.8 joined by a waist of height 0.3.
+	-- Total width 6.0, waist-half-height 0.15 (~5% of diagonal).
+	local leftR, rightR = 1.2, 1.2
+	local leftCx, rightCx = -1.8, 1.8
+	local waistHY = 0.15
+	local pts: { Vector2 } = {}
+	local nArc = 20
+	-- Right lobe from -pi/2 to +pi/2 (CCW outer boundary, going counter-clockwise)
+	for i = 0, nArc do
+		local a = -math.pi / 2 + math.pi * i / nArc
+		table.insert(pts, Vector2.new(rightCx + rightR * math.cos(a), rightR * math.sin(a)))
+	end
+	-- Top waist edge
+	table.insert(pts, Vector2.new(leftCx, waistHY))
+	-- Left lobe from +pi/2 to +3pi/2 (continuing CCW)
+	for i = 0, nArc do
+		local a = math.pi / 2 + math.pi * i / nArc
+		table.insert(pts, Vector2.new(leftCx + leftR * math.cos(a), leftR * math.sin(a)))
+	end
+	-- Bottom waist edge
+	table.insert(pts, Vector2.new(rightCx, -waistHY))
+	return { name = "Dumbbell", profiles = { { outer = pts } } }
+end
+
+local function makeTightHolePair(): Shape
+	-- Outer square (w=5), two circular holes of radius 0.6 centered at x=±0.7.
+	-- Hole centers 1.4 apart, hole edges 0.2 apart: gap < 2% diag (0.14).
+	local outer = rectProfile(0, 0, 5, 5)
+	local holes = {
+		circleProfile(-0.7, 0, 0.6, 16),
+		circleProfile(0.7, 0, 0.6, 16),
+	}
+	return { name = "TightHolePair", profiles = { { outer = outer, holes = holes } } }
+end
+
+local function makeHoleNearEdge(): Shape
+	-- Outer rect (w=5,h=4); hole circle r=0.5 with center at (+1.8, 0),
+	-- leaving 0.2 clearance from the right edge.
+	local outer = rectProfile(0, 0, 5, 4)
+	local holes = {
+		circleProfile(1.8, 0, 0.5, 16),
+	}
+	return { name = "HoleNearEdge", profiles = { { outer = outer, holes = holes } } }
+end
+
+local function makePlusSign(): Shape
+	-- Symmetric + cross with arm width 1.0 and arm length 2.5.
+	-- Contrast with ThinCross (arm 0.18, len 3.6): arm_width/diag = 0.17 here
+	-- vs 0.035 for ThinCross.
+	local arm = 0.5
+	local len = 2.5
+	local pts: { Vector2 } = {
+		Vector2.new(-arm, -len),
+		Vector2.new(arm, -len),
+		Vector2.new(arm, -arm),
+		Vector2.new(len, -arm),
+		Vector2.new(len, arm),
+		Vector2.new(arm, arm),
+		Vector2.new(arm, len),
+		Vector2.new(-arm, len),
+		Vector2.new(-arm, arm),
+		Vector2.new(-len, arm),
+		Vector2.new(-len, -arm),
+		Vector2.new(-arm, -arm),
+	}
+	return { name = "PlusSign", profiles = { { outer = pts } } }
+end
+
+local function makeSharpChevron(): Shape
+	-- V-shape with interior angle ~24° at the bottom outer apex (very acute).
+	-- 6-vertex CCW outer walking: apex -> right OUTER tip -> right INNER tip ->
+	-- fork -> left INNER tip -> left OUTER tip -> apex.
+	-- armPt(side,along,across>0) is the arm's OUTER-side point (larger |x|),
+	-- armPt(side,along,across<0) is the arm's INNER-side point.
+	local armW = 0.4
+	local armL = 3.0
+	local openHalf = math.rad(12) -- half-opening angle
+	local sinH, cosH = math.sin(openHalf), math.cos(openHalf)
+	local function armPt(side: number, along: number, across: number): Vector2
+		local axisX, axisY = side * sinH, cosH
+		local normX, normY = side * cosH, -sinH
+		return Vector2.new(along * axisX + across * normX, along * axisY + across * normY)
+	end
+	local tFork = armW / (2 * math.tan(openHalf))
+	local forkY = tFork * cosH + (armW / 2) * sinH
+	local pts: { Vector2 } = {
+		Vector2.new(0, 0),                         -- 1. bottom outer apex
+		armPt(1, armL, armW / 2),                  -- 2. right arm tip, OUTER edge
+		armPt(1, armL, -armW / 2),                 -- 3. right arm tip, INNER edge
+		Vector2.new(0, forkY),                     -- 4. inner fork apex
+		armPt(-1, armL, -armW / 2),                -- 5. left arm tip, INNER edge
+		armPt(-1, armL, armW / 2),                 -- 6. left arm tip, outer edge
+	}
+	return { name = "SharpChevron", profiles = { { outer = pts } } }
+end
+
+local function makeNestedHoles(): Shape
+	-- Profile 1: ring (outer r=3, hole r=2.4).
+	-- Profile 2: disc with its own hole (outer r=1.8, hole r=1.0), placed at
+	-- origin so it sits inside the ring's hole but disconnected from the ring.
+	local profiles: { ShapeProfile } = {}
+	local ringOuter = circleProfile(0, 0, 3.0, 40)
+	local ringHole = circleProfile(0, 0, 2.4, 32)
+	table.insert(profiles, { outer = ringOuter, holes = { ringHole } })
+	local discOuter = circleProfile(0, 0, 1.8, 32)
+	local discHole = circleProfile(0, 0, 1.0, 24)
+	table.insert(profiles, { outer = discOuter, holes = { discHole } })
+	return { name = "NestedHoles", profiles = profiles }
+end
+
+local function makeScaleSweep(): Shape
+	-- Three scaled copies of a 4-tooth comb-ish profile at 0.5×, 1×, 1.6× scale,
+	-- placed with 0.8 offset so they fit in one grid cell. Each copy exercises
+	-- the same geometry class at a different absolute arm width; with inset
+	-- being diag% of each part's own bbox, this isolates scale-dependent
+	-- thresholds (the same % inset produces proportionally identical regions
+	-- *if* the offset is scale-invariant, which Phase 1 seed evidence suggests
+	-- it is not for thin features).
+	local function comb(scale: number): { Vector2 }
+		local base = 1.2 * scale
+		local toothW = 0.25 * scale
+		local toothH = 0.6 * scale
+		local gap = 0.2 * scale
+		local nTeeth = 4
+		local totalTop = nTeeth * toothW + (nTeeth - 1) * gap
+		local leftX = -totalTop / 2
+		local pts: { Vector2 } = {
+			Vector2.new(-totalTop / 2 - 0.2 * scale, -base / 2),
+			Vector2.new(totalTop / 2 + 0.2 * scale, -base / 2),
+			Vector2.new(totalTop / 2 + 0.2 * scale, base / 2),
+		}
+		for i = nTeeth - 1, 0, -1 do
+			local xR = leftX + (i + 1) * toothW + i * gap
+			local xL = leftX + i * toothW + i * gap
+			table.insert(pts, Vector2.new(xR, base / 2))
+			table.insert(pts, Vector2.new(xR, base / 2 + toothH))
+			table.insert(pts, Vector2.new(xL, base / 2 + toothH))
+			table.insert(pts, Vector2.new(xL, base / 2))
+		end
+		table.insert(pts, Vector2.new(-totalTop / 2 - 0.2 * scale, base / 2))
+		return pts
+	end
+	local profiles: { ShapeProfile } = {
+		{ outer = comb(0.5) },
+		{ outer = comb(1.0) },
+		{ outer = comb(1.6) },
+	}
+	return { name = "ScaleSweep", profiles = profiles }
+end
+
+--------------------------------------------------------------------------------
+-- Wave 4: significantly harder cookies.
+--
+-- These stress the frosting pipeline with:
+--   * many holes per outer (14+),
+--   * mixed hole shapes in a single cookie (circle / square / diamond /
+--     triangle / pentagon / star / plus),
+--   * multiple disconnected islands that each carry their own holes,
+--   * regular lattices that exercise hole-hole and hole-edge thresholds at
+--     many positions simultaneously.
+--------------------------------------------------------------------------------
+
+local function makeMixedHoles(): Shape
+	-- Square outer with six differently-shaped holes. Stresses the hole
+	-- normalization / nesting pipeline with a variety of hole primitives in
+	-- a single mesh.
+	local outer = rectProfile(0, 0, 7, 7)
+	local holes = {
+		circleProfile(0, 0, 0.8, 20),                          -- center circle
+		diamondProfile(-2.2, 2.2, 1.4, 1.4),                   -- NW diamond
+		regularPolygonProfile(2.2, 2.2, 0.9, 3, math.pi / 2),  -- NE triangle
+		rectProfile(-2.2, -2.2, 1.3, 1.3),                     -- SW square
+		starProfileAt(2.2, -2.2, 0.9, 0.4, 5),                 -- SE star
+		regularPolygonProfile(0, 2.5, 0.7, 5, math.pi / 2),    -- N pentagon
+	}
+	return { name = "MixedHoles", profiles = { { outer = outer, holes = holes } } }
+end
+
+local function makeArchipelago(): Shape
+	-- Seven disconnected islands of distinct primitive shapes, laid out at
+	-- explicit positions so the frosting pipeline sees a classic multi-island
+	-- input with no overlapping bounding boxes.
+	return {
+		name = "Archipelago",
+		noOffset = true,
+		profiles = {
+			{ outer = circleProfile(-2.5, 2, 0.9, 20) },
+			{ outer = rectProfile(2.5, 2, 1.5, 1.5) },
+			{ outer = regularPolygonProfile(-2.5, -2, 1.0, 3, math.pi / 2) },
+			{ outer = diamondProfile(2.5, -2, 1.6, 1.6) },
+			{ outer = regularPolygonProfile(0, 2.5, 0.8, 5, math.pi / 2) },
+			{ outer = starProfileAt(0, -2.5, 1.0, 0.4, 5) },
+			{ outer = regularPolygonProfile(0, 0, 0.9, 6) },
+		},
+	}
+end
+
+local function makeHoleyArchipelago(): Shape
+	-- Three disconnected islands where every island carries its own holes.
+	-- Combines multi-island topology with per-island hole nesting.
+	local leftOuter = circleProfile(-3, 0, 1.5, 32)
+	local leftHoles = {
+		circleProfile(-3.4, 0.5, 0.3, 14),
+		circleProfile(-2.7, -0.4, 0.35, 14),
+		rectProfile(-3, 0, 0.5, 0.3),
+	}
+	local midOuter = regularPolygonProfile(0, 0, 1.3, 6)
+	local midHoles = {
+		diamondProfile(-0.4, 0, 0.6, 0.6),
+		circleProfile(0.45, 0, 0.28, 14),
+	}
+	local rightOuter = regularPolygonProfile(3, -0.3, 1.6, 3, math.pi / 2)
+	local rightHoles = {
+		circleProfile(3, 0, 0.4, 14),
+	}
+	return {
+		name = "HoleyArchipelago",
+		noOffset = true,
+		profiles = {
+			{ outer = leftOuter, holes = leftHoles },
+			{ outer = midOuter, holes = midHoles },
+			{ outer = rightOuter, holes = rightHoles },
+		},
+	}
+end
+
+local function makeDiamondLattice(): Shape
+	-- 4x3 grid of diamond-shaped holes in a large rect. Each column / row
+	-- exercises hole-hole spacing simultaneously at twelve sites.
+	local outer = rectProfile(0, 0, 8, 6)
+	local holes: { { Vector2 } } = {}
+	local cols = { -2.7, -0.9, 0.9, 2.7 }
+	local rows = { -2, 0, 2 }
+	for _, x in cols do
+		for _, z in rows do
+			table.insert(holes, diamondProfile(x, z, 0.8, 0.8))
+		end
+	end
+	return { name = "DiamondLattice", profiles = { { outer = outer, holes = holes } } }
+end
+
+local function makeStarburstHoles(): Shape
+	-- Large five-point star with a small circular hole placed inside each
+	-- tip and a diamond hole at the center. Tests holes near acute star
+	-- features combined with a central void.
+	local outer: { Vector2 } = {}
+	local nPoints = 5
+	local rOut = 3.2
+	local rIn = 1.35
+	for i = 0, nPoints * 2 - 1 do
+		local a = math.pi / 2 + 2 * math.pi * i / (nPoints * 2)
+		local r = if i % 2 == 0 then rOut else rIn
+		table.insert(outer, Vector2.new(r * math.cos(a), r * math.sin(a)))
+	end
+	local holes: { { Vector2 } } = {}
+	for i = 0, nPoints - 1 do
+		local a = math.pi / 2 + 2 * math.pi * i / nPoints
+		local cx = 2.1 * math.cos(a)
+		local cz = 2.1 * math.sin(a)
+		table.insert(holes, circleProfile(cx, cz, 0.35, 14))
+	end
+	table.insert(holes, diamondProfile(0, 0, 0.9, 0.9))
+	return { name = "StarburstHoles", profiles = { { outer = outer, holes = holes } } }
+end
+
+local function makeHoneycomb(): Shape
+	-- Hexagonal outer with a honeycomb of 1 + 6 smaller hexagonal holes.
+	local outer = regularPolygonProfile(0, 0, 3.3, 6, math.pi / 6)
+	local holes: { { Vector2 } } = {}
+	table.insert(holes, regularPolygonProfile(0, 0, 0.7, 6, math.pi / 6))
+	for i = 0, 5 do
+		local a = math.pi / 6 + 2 * math.pi * i / 6
+		local cx = 1.75 * math.cos(a)
+		local cz = 1.75 * math.sin(a)
+		table.insert(holes, regularPolygonProfile(cx, cz, 0.65, 6, math.pi / 6))
+	end
+	return { name = "Honeycomb", profiles = { { outer = outer, holes = holes } } }
+end
+
+local function makeChainLinks(): Shape
+	-- Four disconnected ring-like pieces in a row. Each piece is a small
+	-- donut, so the shape combines multi-island topology with per-island
+	-- holes at every island.
+	local profiles: { ShapeProfile } = {}
+	for i = 0, 3 do
+		local cx = -3 + i * 2
+		table.insert(profiles, {
+			outer = circleProfile(cx, 0, 0.9, 24),
+			holes = { circleProfile(cx, 0, 0.5, 18) },
+		})
+	end
+	return { name = "ChainLinks", noOffset = true, profiles = profiles }
+end
+
+local function makeFractalPlus(): Shape
+	-- Large plus outline with four smaller plus-shaped holes placed one per
+	-- arm, and a central diamond hole.
+	local outer = plusProfile(0, 0, 3.2, 1.0)
+	local holes = {
+		plusProfile(2.2, 0, 0.6, 0.2),
+		plusProfile(-2.2, 0, 0.6, 0.2),
+		plusProfile(0, 2.2, 0.6, 0.2),
+		plusProfile(0, -2.2, 0.6, 0.2),
+		diamondProfile(0, 0, 0.8, 0.8),
+	}
+	return { name = "FractalPlus", profiles = { { outer = outer, holes = holes } } }
+end
+
+local function makeDenseMultiHole(): Shape
+	-- 7x7 rect densely packed with 13 mixed-shape holes. Intentionally
+	-- pushes the hole count and variety well beyond SwissCheese.
+	local outer = rectProfile(0, 0, 7, 7)
+	local holes = {
+		starProfileAt(-2.5, 2.5, 0.55, 0.22, 5),
+		diamondProfile(2.5, 2.5, 1.0, 1.0),
+		rectProfile(-2.5, -2.5, 1.0, 1.0),
+		regularPolygonProfile(2.5, -2.5, 0.6, 3, math.pi / 2),
+		circleProfile(0, 2.5, 0.5, 16),
+		circleProfile(0, -2.5, 0.5, 16),
+		rectProfile(-2.5, 0, 0.9, 0.9),
+		diamondProfile(2.5, 0, 1.0, 1.0),
+		circleProfile(0, 0, 0.5, 16),
+		regularPolygonProfile(-1.2, 1.2, 0.35, 3, math.pi / 2),
+		diamondProfile(1.2, 1.2, 0.5, 0.5),
+		circleProfile(-1.2, -1.2, 0.35, 14),
+		starProfileAt(1.2, -1.2, 0.35, 0.15, 5),
+	}
+	return { name = "DenseMultiHole", profiles = { { outer = outer, holes = holes } } }
+end
+
+local function makeMultiIslandComplex(): Shape
+	-- Four disconnected islands, each carrying several mixed-shape holes.
+	-- Combines archipelago topology with Swiss-cheese-style hole density on
+	-- every island.
+	local nwOuter = circleProfile(-2.5, 2.5, 1.4, 28)
+	local nwHoles = {
+		diamondProfile(-2.8, 2.8, 0.5, 0.5),
+		rectProfile(-2.2, 2.2, 0.5, 0.5),
+		circleProfile(-2.5, 2.5, 0.25, 14),
+	}
+	local neOuter = rectProfile(2.5, 2.5, 2.6, 2.6)
+	local neHoles = {
+		circleProfile(2.0, 2.8, 0.35, 14),
+		circleProfile(3.0, 2.0, 0.35, 14),
+		regularPolygonProfile(2.8, 2.2, 0.4, 3, math.pi / 2),
+	}
+	local swOuter = regularPolygonProfile(-2.5, -2.5, 1.5, 5, math.pi / 2)
+	local swHoles = {
+		circleProfile(-2.9, -2.2, 0.25, 14),
+		circleProfile(-2.1, -2.2, 0.25, 14),
+		circleProfile(-2.5, -2.9, 0.25, 14),
+	}
+	local seOuter = regularPolygonProfile(2.5, -2.5, 1.5, 6)
+	local seHoles = {
+		starProfileAt(2.5, -2.5, 0.7, 0.3, 5),
+	}
+	return {
+		name = "MultiIslandComplex",
+		noOffset = true,
+		profiles = {
+			{ outer = nwOuter, holes = nwHoles },
+			{ outer = neOuter, holes = neHoles },
+			{ outer = swOuter, holes = swHoles },
+			{ outer = seOuter, holes = seHoles },
+		},
+	}
+end
+
 local ALL_SHAPES: { () -> Shape } = {
 	makeCircle,
 	makeStar,
@@ -620,6 +1096,25 @@ local ALL_SHAPES: { () -> Shape } = {
 	makeNestedRing,
 	makeButterfly,
 	makeSpikeCircle,
+	-- Wave 3 - Phase 1 synthesized edge cases
+	makeDumbbell,
+	makeTightHolePair,
+	makeHoleNearEdge,
+	makePlusSign,
+	makeSharpChevron,
+	makeNestedHoles,
+	makeScaleSweep,
+	-- Wave 4 - significantly harder cookies
+	makeMixedHoles,
+	makeArchipelago,
+	makeHoleyArchipelago,
+	makeDiamondLattice,
+	makeStarburstHoles,
+	makeHoneycomb,
+	makeChainLinks,
+	makeFractalPlus,
+	makeDenseMultiHole,
+	makeMultiIslandComplex,
 }
 
 local function generateAll()
@@ -643,8 +1138,12 @@ local function generateAll()
 			part.Color = Color3.fromRGB(210, 170, 109) -- cookie brown
 			part.Material = Enum.Material.SmoothPlastic
 
-			-- Offset for disconnected pieces within a shape
-			local offsetX = if #shape.profiles > 1 then (pi - 1) * 0.5 else 0
+			-- Offset for disconnected pieces within a shape. Archipelago-style
+			-- shapes (noOffset) already place each island at distinct local
+			-- coordinates, so the extra offset just smears the layout.
+			local offsetX = if #shape.profiles > 1 and not shape.noOffset
+				then (pi - 1) * 0.5
+				else 0
 			part.CFrame = CFrame.new(baseX + offsetX, COOKIE_HEIGHT / 2, baseZ)
 			part.Parent = folder
 		end

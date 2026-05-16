@@ -10,12 +10,9 @@
 
 local AssetService = game:GetService("AssetService")
 local PolygonInset = require(script.Parent.PolygonInset)
-local PolygonOffset = require(script.Parent.PolygonOffset)
+local PolygonNesting = require(script.Parent.PolygonNesting)
 
-export type Island = {
-	outer: { Vector2 },
-	holes: { { Vector2 } },
-}
+export type Island = PolygonNesting.PolygonWithHoles
 
 export type TopFaceResult = {
 	islands: { Island },
@@ -23,15 +20,29 @@ export type TopFaceResult = {
 }
 
 local NORMAL_UP_THRESHOLD = 0.7
-local Y_SNAP_TOLERANCE = 0.02
-local POSITION_SNAP = 1000
 
-local function posKey(pos: Vector3): string
-	local x = math.round(pos.X * POSITION_SNAP)
-	local y = math.round(pos.Y * POSITION_SNAP)
-	local z = math.round(pos.Z * POSITION_SNAP)
-	return x .. "," .. y .. "," .. z
-end
+-- Y_SNAP_TOLERANCE is chosen adaptively per-mesh in `extract`.  The value
+-- controls which vertices of upward-facing faces are considered part of the
+-- shared top plane.  A fixed 0.02 was too coarse for stacked frosting layers
+-- whose extrude height (cookie-diagonal * EXTRUDE_FRACTION) shrinks below
+-- 0.02, which caused the bottom rim of a thin cap to be mis-classified as part
+-- of the top plane and fuse with it on mesh re-extraction (F9/F2 root cause
+-- for thin stacked caps).  We target 5% of the mesh's Y extent with a relative
+-- floor so we never exceed the planar-EPS grid resolution.
+local Y_SNAP_FRACTION = 0.05
+local Y_SNAP_FLOOR_FRACTION = 1e-5
+
+-- POSITION_SNAP is chosen adaptively per-mesh in `extract`.  We target 4
+-- decimal digits of precision relative to the mesh bounding box diagonal:
+--   * mesh-scale cookies don't lose distinct vertices to over-welding
+--   * tiny stacked frosting caps still dedup coincident vertices reliably
+-- Empirically matching the downstream PolygonOffset grid (1e5) over-preserves
+-- floating-point noise from EditableMesh storage and causes cap boundaries
+-- to grow spurious near-collinear vertices on every iteration (ScaleSweep,
+-- TightHolePair, Maze all regress 4-6 layers with the finer grid).  The 1e4
+-- grid acts as a mild noise filter that the downstream PolygonInset/Offset
+-- eps (diag * 1e-5, ~10x finer) then refines as needed.
+local POSITION_SNAP_TARGET_DIGITS = 1e4
 
 local function edgeKey(a: string, b: string): string
 	if a < b then
@@ -43,6 +54,27 @@ end
 
 local function extract(meshPart: MeshPart): TopFaceResult
 	local em = AssetService:CreateEditableMeshAsync(meshPart.MeshContent, { FixedSize = false })
+
+	-- Adaptive POSITION_SNAP: target ~4 significant digits across the part's
+	-- bounding-box diagonal.  Small cookies (stacked frosting) otherwise lose
+	-- distinct vertices to the old fixed 1e-3 snap; large cookies with fine
+	-- detail otherwise fail to dedup near-identical positions.
+	local meshSize = meshPart.Size
+	local diag = math.sqrt(meshSize.X ^ 2 + meshSize.Y ^ 2 + meshSize.Z ^ 2)
+	local snap = if diag > 1e-6 then POSITION_SNAP_TARGET_DIGITS / diag else 1000
+
+	-- Scale Y snap to the part's Y extent so stacked frosting layers (whose
+	-- extrude height is proportional to their cookie-diagonal, not absolute)
+	-- never merge bottom-rim verts into the top plane.  The floor is also
+	-- relative to meshSize.Y so the snap never exceeds the planar EPS grid.
+	local ySnapTolerance = math.max(meshSize.Y * Y_SNAP_FRACTION, meshSize.Y * Y_SNAP_FLOOR_FRACTION)
+
+	local function posKey(pos: Vector3): string
+		local x = math.round(pos.X * snap)
+		local y = math.round(pos.Y * snap)
+		local z = math.round(pos.Z * snap)
+		return x .. "," .. y .. "," .. z
+	end
 
 	-- 1. Build position-merge map
 	local vidToPosKey: { [number]: string } = {}
@@ -91,7 +123,7 @@ local function extract(meshPart: MeshPart): TopFaceResult
 	for _, faceId in topFaceIds do
 		for _, vid in em:GetFaceVertices(faceId) do
 			local pos = em:GetPosition(vid)
-			if math.abs(pos.Y - maxY) <= Y_SNAP_TOLERANCE then
+			if math.abs(pos.Y - maxY) <= ySnapTolerance then
 				topPosKeys[vidToPosKey[vid]] = true
 			end
 		end
@@ -156,7 +188,13 @@ local function extract(meshPart: MeshPart): TopFaceResult
 		if #cands == 0 then return nil end
 		if #cands == 1 then return cands[1] end
 
-		-- Multiple candidates: pick leftmost turn (smallest CCW angle)
+		-- Multiple candidates: pick leftmost turn (smallest CCW angle) so that
+		-- a walk starting on a CCW outer boundary stays on the outer and a
+		-- walk starting on a CW hole boundary stays on that hole.  "Straightest
+		-- continuation" might feel more natural at a crossover but it is
+		-- orientation-blind: at a genuine degree-4 junction (two hole boundaries
+		-- crossing at a shared tip), straightest can flip the winding of one
+		-- sub-loop and cause PolygonNesting.classify to emit a phantom island.
 		local curPos = posKeyToPos[curPk]
 		local inDir: Vector2
 		if prevPk then
@@ -214,108 +252,34 @@ local function extract(meshPart: MeshPart): TopFaceResult
 	assert(#chains > 0, "No boundary chains found on top face")
 
 	-- 7. Convert chains to Vector2 polygons
-	type ChainInfo = {
-		poly: { Vector2 },
-		area: number,
-	}
-	local chainInfos: { ChainInfo } = {}
-
+	local chainPolys: { { Vector2 } } = {}
 	for _, chain in chains do
 		local poly: { Vector2 } = {}
 		for _, pk in chain do
 			local pos = posKeyToPos[pk]
 			table.insert(poly, Vector2.new(pos.X, pos.Z))
 		end
-		table.insert(chainInfos, {
-			poly = poly,
-			area = math.abs(PolygonInset.signedArea(poly)),
-		})
+		table.insert(chainPolys, poly)
 	end
 
-	-- 8. Classify chains into islands using containment -----------------------
-	--    A chain contained by zero others → outer boundary of an island.
-	--    A chain contained by exactly one other → hole of that island.
-	--    A chain contained by N (even) others → outer boundary (nested island).
-	--    A chain contained by N (odd) others  → hole.
+	-- 8. Classify chains into islands via even/odd containment depth.
+	local islands: { Island } = PolygonNesting.classify(chainPolys)
 
-	local nChains = #chainInfos
-
-	-- For each chain, pick a sample vertex and count how many other chains
-	-- contain that point.
-	local containedBy: { { number } } = {} -- containedBy[i] = list of chain indices that contain chain i
-	for i = 1, nChains do
-		containedBy[i] = {}
-	end
-
-	for i = 1, nChains do
-		local samplePt = chainInfos[i].poly[1]
-		for j = 1, nChains do
-			if i == j then
-				continue
-			end
-			if PolygonOffset.pointInPolygon(samplePt, chainInfos[j].poly) then
-				table.insert(containedBy[i], j)
-			end
-		end
-	end
-
-	-- Build islands: even nesting depth = outer, odd = hole
-	local islandMap: { [number]: Island } = {} -- outer chain index → Island
-	local holeAssignment: { [number]: number } = {} -- hole chain index → outer chain index
-
-	for i = 1, nChains do
-		local depth = #containedBy[i]
-		if depth % 2 == 0 then
-			-- Outer boundary
-			islandMap[i] = {
-				outer = PolygonInset.ensureCCW(chainInfos[i].poly),
-				holes = {},
-			}
-		end
-	end
-
-	for i = 1, nChains do
-		local depth = #containedBy[i]
-		if depth % 2 == 1 then
-			-- Hole: find its immediate parent (the containing chain with the
-			-- smallest area among those at depth-1 nesting).
-			local bestParent: number? = nil
-			local bestArea = math.huge
-			for _, parentIdx in containedBy[i] do
-				if #containedBy[parentIdx] == depth - 1 then
-					if chainInfos[parentIdx].area < bestArea then
-						bestArea = chainInfos[parentIdx].area
-						bestParent = parentIdx
-					end
-				end
-			end
-			if bestParent and islandMap[bestParent] then
-				table.insert(islandMap[bestParent].holes, chainInfos[i].poly)
-				holeAssignment[i] = bestParent
-			end
-		end
-	end
-
-	-- Collect islands into an array
-	local islands: { Island } = {}
-	for _, island in islandMap do
-		table.insert(islands, island)
-	end
-
-	-- Fallback: if the classification yielded nothing, use the legacy approach
-	-- (largest polygon = outer, rest = holes).
+	-- Fallback: if classification yielded nothing (pathological input), treat
+	-- the largest polygon as outer and the rest as holes.
 	if #islands == 0 then
-		table.sort(chainInfos, function(a, b)
-			return a.area > b.area
+		table.sort(chainPolys, function(a, b)
+			return math.abs(PolygonInset.signedArea(a))
+				> math.abs(PolygonInset.signedArea(b))
 		end)
-		local fallbackIsland: Island = {
-			outer = PolygonInset.ensureCCW(chainInfos[1].poly),
+		local fallback: Island = {
+			outer = PolygonInset.ensureCCW(chainPolys[1]),
 			holes = {},
 		}
-		for i = 2, nChains do
-			table.insert(fallbackIsland.holes, chainInfos[i].poly)
+		for i = 2, #chainPolys do
+			table.insert(fallback.holes, PolygonInset.ensureCCW(chainPolys[i]))
 		end
-		table.insert(islands, fallbackIsland)
+		table.insert(islands, fallback)
 	end
 
 	em:Destroy()

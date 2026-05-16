@@ -15,8 +15,6 @@
 
 local AssetService = game:GetService("AssetService")
 local PolygonInset = require(script.Parent.PolygonInset)
-local PolygonClip = require(script.Parent.PolygonClip)
-local PolygonOffset = require(script.Parent.PolygonOffset)
 
 --------------------------------------------------------------------------------
 -- Types
@@ -36,6 +34,13 @@ local earClipTriangulate = PolygonInset.earClipTriangulate
 
 --------------------------------------------------------------------------------
 -- Bridge merging: merge a CCW hole into a CCW outer polygon
+--
+-- PolygonOffset.offsetPWH guarantees that each region's holes are:
+--   * simple, CCW, mutually non-overlapping
+--   * strictly contained in a simple CCW outer
+-- so bridge merging only needs to find a non-crossing bridge between outer and
+-- each hole in turn; it never has to reason about overlap or containment
+-- anomalies.
 --------------------------------------------------------------------------------
 
 -- Proper segment-segment intersection test (returns true if interiors cross).
@@ -53,86 +58,17 @@ local function segsCross(p1: Vector2, p2: Vector2, p3: Vector2, p4: Vector2): bo
 	return t > EPS and t < 1 - EPS and u > EPS and u < 1 - EPS
 end
 
-local function mergeHoleIntoPolygon(
-	mergedPoly: { Vector2 },
-	mergedOrigins: { { source: number, idx: number } },
-	holePoly: { Vector2 },
-	holeIndex: number
-): ({ Vector2 }, { { source: number, idx: number } })
-	local nh = #holePoly
-	local nm = #mergedPoly
-
-	-- Collect all candidate bridge pairs sorted by distance.
-	local candidates: { { mi: number, hi: number, dist: number } } = {}
-	for mi = 1, nm do
-		for hi = 1, nh do
-			table.insert(candidates, { mi = mi, hi = hi, dist = (mergedPoly[mi] - holePoly[hi]).Magnitude })
-		end
-	end
-	table.sort(candidates, function(a, b)
-		return a.dist < b.dist
-	end)
-
-	-- Pick the shortest bridge whose edge doesn't cross any polygon edge.
-	local bridgeIdx = candidates[1].mi
-	local holeStartIdx = candidates[1].hi
-	for _, cand in candidates do
-		local bp = mergedPoly[cand.mi]
-		local hp = holePoly[cand.hi]
-		local valid = true
-		for i = 1, nm do
-			local i2 = (i % nm) + 1
-			if i == cand.mi or i2 == cand.mi then continue end
-			if segsCross(bp, hp, mergedPoly[i], mergedPoly[i2]) then
-				valid = false
-				break
-			end
-		end
-		if valid then
-			for i = 1, nh do
-				local i2 = (i % nh) + 1
-				if i == cand.hi or i2 == cand.hi then continue end
-				if segsCross(bp, hp, holePoly[i], holePoly[i2]) then
-					valid = false
-					break
-				end
-			end
-		end
-		if valid then
-			bridgeIdx = cand.mi
-			holeStartIdx = cand.hi
-			break
-		end
-	end
-
-	local newPoly: { Vector2 } = {}
-	local newOrigins: { { source: number, idx: number } } = {}
-
-	for i = 1, bridgeIdx do
-		table.insert(newPoly, mergedPoly[i])
-		table.insert(newOrigins, mergedOrigins[i])
-	end
-
-	for k = 0, nh do
-		local idx = ((holeStartIdx - 1 - k) % nh) + 1
-		table.insert(newPoly, holePoly[idx])
-		table.insert(newOrigins, { source = holeIndex, idx = idx })
-	end
-
-	table.insert(newPoly, mergedPoly[bridgeIdx])
-	table.insert(newOrigins, mergedOrigins[bridgeIdx])
-
-	for i = bridgeIdx + 1, nm do
-		table.insert(newPoly, mergedPoly[i])
-		table.insert(newOrigins, mergedOrigins[i])
-	end
-
-	return newPoly, newOrigins
-end
-
 -- Bridge-merge a hole into the merged polygon, tracking vertex IDs directly.
 -- `otherHoles` are all remaining unmerged holes whose edges the bridge must
 -- also avoid crossing.
+-- `reservedOuter` is the set of Vector2 positions already used as a bridge
+-- outer-endpoint by a prior hole in the same region.  Reusing an outer
+-- endpoint creates a degree-3 junction in the top-face boundary graph that
+-- TopFaceExtractor's leftmost-turn chain walk cannot disambiguate; the
+-- result is one hole's boundary being silently merged into another (the
+-- pre-Phase-2 Maze L1 F2 "dropped right slit" observation).  By picking a
+-- distinct outer endpoint per hole we guarantee each slit retains a
+-- well-formed boundary loop after re-extraction.
 -- Returns (newPoly, newVids, true) on success, or (mergedPoly, mergedVids, false)
 -- when no non-crossing bridge exists (caller should retry later).
 local function mergeHoleVids(
@@ -140,10 +76,17 @@ local function mergeHoleVids(
 	mergedVids: { number },
 	holePoly: { Vector2 },
 	holeVids: { number },
-	otherHoles: { { Vector2 } }?
-): ({ Vector2 }, { number }, boolean)
+	otherHoles: { { Vector2 } }?,
+	reservedOuter: { Vector2 }?
+): ({ Vector2 }, { number }, boolean, Vector2?)
 	local nh = #holePoly
 	local nm = #mergedPoly
+	-- Reserved-outer-endpoint dedup tolerance must match downstream ear-clip's
+	-- pinch / coincident thresholds (diag * 1e-5).  A too-tight RESERVED_EPS
+	-- would let the same mesh vertex serve as bridge endpoint for two holes,
+	-- recreating the degree-3 junction that TopFaceExtractor's chain walk
+	-- silently folds into a lost hole boundary.
+	local RESERVED_EPS = PolygonInset.computeEps(mergedPoly)
 
 	local candidates: { { mi: number, hi: number, dist: number } } = {}
 	for mi = 1, nm do
@@ -155,53 +98,66 @@ local function mergeHoleVids(
 		return a.dist < b.dist
 	end)
 
+	local function isReserved(p: Vector2): boolean
+		if not reservedOuter then return false end
+		for _, r in reservedOuter do
+			if (r - p).Magnitude < RESERVED_EPS then return true end
+		end
+		return false
+	end
+
 	local bridgeIdx: number? = nil
 	local holeStartIdx: number? = nil
-	for _, cand in candidates do
-		local bp = mergedPoly[cand.mi]
-		local hp = holePoly[cand.hi]
-		local valid = true
-		for i = 1, nm do
-			local i2 = (i % nm) + 1
-			if i == cand.mi or i2 == cand.mi then continue end
-			if segsCross(bp, hp, mergedPoly[i], mergedPoly[i2]) then
-				valid = false
-				break
-			end
-		end
-		if valid then
-			for i = 1, nh do
-				local i2 = (i % nh) + 1
-				if i == cand.hi or i2 == cand.hi then continue end
-				if segsCross(bp, hp, holePoly[i], holePoly[i2]) then
+	-- Two passes: first prefer a non-reserved outer endpoint; if none is
+	-- viable, fall back to reuse (better a junction than no bridge).
+	for pass = 1, 2 do
+		for _, cand in candidates do
+			local bp = mergedPoly[cand.mi]
+			local hp = holePoly[cand.hi]
+			if pass == 1 and isReserved(bp) then continue end
+			local valid = true
+			for i = 1, nm do
+				local i2 = (i % nm) + 1
+				if i == cand.mi or i2 == cand.mi then continue end
+				if segsCross(bp, hp, mergedPoly[i], mergedPoly[i2]) then
 					valid = false
 					break
 				end
 			end
-		end
-		-- Also check against all other unmerged hole edges.
-		if valid and otherHoles then
-			for _, oh in otherHoles do
-				local noh = #oh
-				for i = 1, noh do
-					local i2 = (i % noh) + 1
-					if segsCross(bp, hp, oh[i], oh[i2]) then
+			if valid then
+				for i = 1, nh do
+					local i2 = (i % nh) + 1
+					if i == cand.hi or i2 == cand.hi then continue end
+					if segsCross(bp, hp, holePoly[i], holePoly[i2]) then
 						valid = false
 						break
 					end
 				end
-				if not valid then break end
+			end
+			if valid and otherHoles then
+				for _, oh in otherHoles do
+					local noh = #oh
+					for i = 1, noh do
+						local i2 = (i % noh) + 1
+						if segsCross(bp, hp, oh[i], oh[i2]) then
+							valid = false
+							break
+						end
+					end
+					if not valid then break end
+				end
+			end
+			if valid then
+				bridgeIdx = cand.mi
+				holeStartIdx = cand.hi
+				break
 			end
 		end
-		if valid then
-			bridgeIdx = cand.mi
-			holeStartIdx = cand.hi
-			break
-		end
+		if bridgeIdx then break end
 	end
 
 	if not bridgeIdx or not holeStartIdx then
-		return mergedPoly, mergedVids, false
+		return mergedPoly, mergedVids, false, nil
 	end
 
 	local newP: { Vector2 } = {}
@@ -223,7 +179,7 @@ local function mergeHoleVids(
 		table.insert(newV, mergedVids[i])
 	end
 
-	return newP, newV, true
+	return newP, newV, true, mergedPoly[bridgeIdx]
 end
 
 -- Remove near-duplicate and collinear vertices from merged cap boundary; keeps
@@ -232,7 +188,9 @@ local function stripCollinearMerged(
 	mergedPoly: { Vector2 },
 	mergedOrigins: { { source: number, idx: number } }
 ): ({ Vector2 }, { { source: number, idx: number } })
-	local COL_EPS = 1e-5
+	-- Collinear tolerance scales with polygon size so this matches the
+	-- pre-weld done by earClipTriangulate on the same polygon.
+	local COL_EPS = PolygonInset.computeEps(mergedPoly)
 	local cross2D = function(o: Vector2, a: Vector2, b: Vector2): number
 		return (a.X - o.X) * (b.Y - o.Y) - (a.Y - o.Y) * (b.X - o.X)
 	end
@@ -269,64 +227,6 @@ local function stripCollinearMerged(
 	return workP, workO
 end
 
--- Try to merge two polygons into one using PolygonClip.  The W-A union has
--- a walk-direction bug for partially-overlapping convex polygons that causes
--- it to return the intersection instead of the union.  Work around this by
--- also trying PolygonClip.intersection as a fallback (which, due to the same
--- bug, returns the union for partially-overlapping inputs).  An area check
--- guards against accepting any bogus result.
-local function tryMerge(a: { Vector2 }, b: { Vector2 }): { Vector2 }?
-	local areaA = math.abs(PolygonInset.signedArea(a))
-	local areaB = math.abs(PolygonInset.signedArea(b))
-	local maxA = math.max(areaA, areaB)
-
-	-- Attempt 1: PolygonClip.union (correct for containment cases)
-	local merged = PolygonClip.union(a, b)
-	if #merged > 0 then
-		local mp = PolygonInset.ensureCCW(merged[1])
-		if math.abs(PolygonInset.signedArea(mp)) >= maxA * 0.9 then
-			return mp
-		end
-	end
-
-	-- Attempt 2: PolygonClip.intersection (produces the union for partial overlap)
-	merged = PolygonClip.intersection(a, b)
-	if #merged > 0 then
-		local mp = PolygonInset.ensureCCW(merged[1])
-		if math.abs(PolygonInset.signedArea(mp)) >= maxA * 0.9 then
-			return mp
-		end
-	end
-
-	return nil
-end
-
--- Merge overlapping hole outset polygons so that bridge-merging never
--- encounters crossing edges from two overlapping holes.
-local function unionOverlappingHoles(holes: { { Vector2 } }): { { Vector2 } }
-	local result: { { Vector2 } } = {}
-	for _, h in holes do
-		table.insert(result, PolygonInset.ensureCCW(h))
-	end
-	local changed = true
-	while changed do
-		changed = false
-		for i = 1, #result do
-			for j = i + 1, #result do
-				local mp = tryMerge(result[i], result[j])
-				if mp then
-					result[i] = mp
-					table.remove(result, j)
-					changed = true
-					break
-				end
-			end
-			if changed then break end
-		end
-	end
-	return result
-end
-
 --------------------------------------------------------------------------------
 -- Build a single region (outer + holes) into the given EditableMesh
 --------------------------------------------------------------------------------
@@ -356,11 +256,12 @@ local function buildRegion(
 		table.insert(outerCapVids, em:AddVertex(Vector3.new(p.X, capY, p.Y)))
 	end
 
-	-- Merge overlapping holes up front so both side walls and cap use the same
-	-- clean geometry.  Without this, two overlapping hole polygons would each
-	-- get their own inner side walls, causing wall quads to cross through the
-	-- shared open space and appear as floating geometry inside the holes.
-	local holeOutsets = unionOverlappingHoles(region.holes)
+	-- offsetPWH guarantees holes are non-overlapping, CCW, strictly contained
+	-- in the outer; just CCW-normalize defensively.
+	local holeOutsets: { { Vector2 } } = {}
+	for _, h in region.holes do
+		table.insert(holeOutsets, PolygonInset.ensureCCW(h))
+	end
 
 	-- Hole boundary vertices: rim, wall-top, cap (separated for normals)
 	local allHoleRimVids: { { number } } = {}
@@ -421,6 +322,7 @@ local function buildRegion(
 
 		local maxRetries = #queue * #queue
 		local retries = 0
+		local reservedOuter: { Vector2 } = {}
 		while #queue > 0 and retries < maxRetries do
 			local h = queue[1]
 			table.remove(queue, 1)
@@ -428,13 +330,14 @@ local function buildRegion(
 			for _, oh in queue do
 				table.insert(others, holeOutsets[oh])
 			end
-			local newP, newV, ok = mergeHoleVids(
-				mergedPoly, mergedVids, holeOutsets[h], allHoleCapVids[h], others
+			local newP, newV, ok, usedOuter = mergeHoleVids(
+				mergedPoly, mergedVids, holeOutsets[h], allHoleCapVids[h], others, reservedOuter
 			)
 			if ok then
 				mergedPoly = newP
 				mergedVids = newV
 				retries = 0
+				if usedOuter then table.insert(reservedOuter, usedOuter) end
 			else
 				table.insert(queue, h)
 				retries += 1
