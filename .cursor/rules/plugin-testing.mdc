@@ -26,5 +26,5 @@ Run these after every rebuild:
    c.FieldOfView = 30
    ```
 
-   Keep the same camera across L0 / L2 / max captures so layers compare pixel-aligned.
+   Keep the same camera across L0 / L2 / max captures so layers compare pixel-aligned. Before capturing a screenshot, make sure that nothing is selected or highlighted, unless the intention is to screenshot a selected object. We don't want to see any dragger handles or outlines if we don't need to.
 6. Read `get_console_output` to verify no `[FrostingPlugin]` warnings were emitted.

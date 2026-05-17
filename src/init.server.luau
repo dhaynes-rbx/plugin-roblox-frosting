@@ -148,7 +148,7 @@ end
 
 -- Configuration ---------------------------------------------------------
 
-local INSET_FRACTION = 0.02
+local INSET_AMOUNT = 0.15
 local EXTRUDE_FRACTION = 0.02
 
 local FROSTING_MATERIAL = Enum.Material.SmoothPlastic
@@ -321,16 +321,19 @@ function createFrostingForPart(cookiePart: MeshPart, prefix: string): (boolean, 
 		local extracted = TopFaceExtractor.extract(cookiePart)
 
 		local diag = meshBBoxDiagonalXZ(cookiePart)
-		local insetAmount = diag * INSET_FRACTION
+		local insetAmount = INSET_AMOUNT
 		local extrudeHeight = diag * EXTRUDE_FRACTION
 
 		setStatus(prefix .. "Computing offsets…")
 
 		local allRegions: { FrostingBuilder.FrostingRegion } = {}
+		local minRegionArea = insetAmount * insetAmount
 		for _, island in extracted.islands do
 			local pwhRegions = PolygonOffset.offsetPWH(island, insetAmount)
 			for _, r in pwhRegions do
-				table.insert(allRegions, r)
+				if math.abs(polySignedArea(r.outer)) >= minRegionArea then
+					table.insert(allRegions, r)
+				end
 			end
 		end
 

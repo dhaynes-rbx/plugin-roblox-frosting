@@ -505,6 +505,205 @@ local function offset(originalPoly: { Vector2 }, distance: number): { { Vector2 
 		table.insert(result, poly)
 	end
 
+	-- Fallback: when the standard DCEL produces no results but there are
+	-- self-intersections, the polygon likely has thin features that invert
+	-- without creating proper crossings (inverted edges share endpoints
+	-- instead of crossing).  Fix by computing the intersection of the raw
+	-- offset with the original polygon: build a combined planar graph from
+	-- both edge sets, extract faces, and keep faces inside both polygons.
+	if #result == 0 and #isects > 0 and distance > 0 then
+		local allNodes: { Vector2 } = {}
+		local allNodeIdx: { [string]: number } = {}
+		local function nkey2(p: Vector2): string
+			return math.round(p.X * NODE_SNAP) .. "," .. math.round(p.Y * NODE_SNAP)
+		end
+		local function addNode2(p: Vector2): number
+			local k = nkey2(p)
+			if allNodeIdx[k] then return allNodeIdx[k] end
+			table.insert(allNodes, p)
+			allNodeIdx[k] = #allNodes
+			return #allNodes
+		end
+
+		-- Collect edges from both polygons
+		type PolyEdge = { p1: Vector2, p2: Vector2 }
+		local polyEdges: { PolyEdge } = {}
+		for i = 1, #raw do
+			table.insert(polyEdges, { p1 = raw[i], p2 = raw[(i % #raw) + 1] })
+		end
+		for i = 1, #ccwOrig do
+			table.insert(polyEdges, { p1 = ccwOrig[i], p2 = ccwOrig[(i % #ccwOrig) + 1] })
+		end
+
+		-- Find all intersections between edges
+		type SplitInfo = { { t: number, point: Vector2 } }
+		local eSplits: { SplitInfo } = {}
+		for i = 1, #polyEdges do eSplits[i] = {} end
+
+		for i = 1, #polyEdges - 1 do
+			for j = i + 1, #polyEdges do
+				-- Skip adjacent edges within the same polygon
+				local sameOrig = (i > #raw) == (j > #raw)
+				if sameOrig then
+					local len = if i <= #raw then #raw else #ccwOrig
+					local base = if i <= #raw then 0 else #raw
+					local ei = i - base
+					local ej = j - base
+					if ej - ei == 1 then continue end
+					if ei == 1 and ej == len then continue end
+				end
+
+				local t, u, pt = segSegIntersect(
+					polyEdges[i].p1, polyEdges[i].p2,
+					polyEdges[j].p1, polyEdges[j].p2
+				)
+				if t and u and pt then
+					table.insert(eSplits[i], { t = t, point = pt })
+					table.insert(eSplits[j], { t = u, point = pt })
+				end
+			end
+		end
+
+		for i = 1, #polyEdges do
+			table.sort(eSplits[i], function(a, b) return a.t < b.t end)
+		end
+
+		-- Add all vertices and intersection points as nodes
+		for _, pe in polyEdges do addNode2(pe.p1) end
+		for _, sp in eSplits do
+			for _, s in sp do addNode2(s.point) end
+		end
+
+		-- Build directed edge graph
+		type DirEdge2 = { from: number, to: number }
+		local de2: { DirEdge2 } = {}
+		local out2: { { number } } = {}
+		for i = 1, #allNodes do out2[i] = {} end
+
+		local function addDE2(from: number, to: number)
+			if from == to then return end
+			table.insert(de2, { from = from, to = to })
+			table.insert(out2[from], #de2)
+		end
+
+		for ei, pe in polyEdges do
+			local from = addNode2(pe.p1)
+			for _, sp in eSplits[ei] do
+				local to = addNode2(sp.point)
+				addDE2(from, to); addDE2(to, from)
+				from = to
+			end
+			local to = addNode2(pe.p2)
+			addDE2(from, to); addDE2(to, from)
+		end
+
+		-- Sort outgoing edges by angle
+		for ni = 1, #allNodes do
+			table.sort(out2[ni], function(a, b)
+				local da = allNodes[de2[a].to] - allNodes[ni]
+				local db = allNodes[de2[b].to] - allNodes[ni]
+				return dirAngle(da) < dirAngle(db)
+			end)
+		end
+
+		-- Leftmost-turn face extraction
+		local function findNext2(eIdx: number): number?
+			local e = de2[eIdx]
+			local v = e.to
+			local outs = out2[v]
+			if #outs == 0 then return nil end
+			if #outs == 1 then return outs[1] end
+			local inDir = allNodes[v] - allNodes[e.from]
+			local revAngle = normalizeAngle(dirAngle(inDir) + math.pi)
+			local best: number = outs[#outs]
+			for k = #outs, 1, -1 do
+				local cand = outs[k]
+				local candAngle = dirAngle(allNodes[de2[cand].to] - allNodes[v])
+				if candAngle < revAngle - 1e-9 then
+					best = cand; break
+				end
+			end
+			return best
+		end
+
+		local used2: { [number]: boolean } = {}
+		local cycles2: { { number } } = {}
+		for startE = 1, #de2 do
+			if used2[startE] then continue end
+			local cyc: { number } = {}
+			local cur = startE
+			local ok2 = true
+			for _ = 1, #de2 + 1 do
+				if used2[cur] then
+					if cur == startE then break end
+					ok2 = false; break
+				end
+				used2[cur] = true
+				table.insert(cyc, de2[cur].from)
+				local nxt = findNext2(cur)
+				if not nxt then ok2 = false; break end
+				cur = nxt
+			end
+			if ok2 and #cyc >= 3 then table.insert(cycles2, cyc) end
+		end
+
+		-- Keep faces that are properly inset: inside the original, with
+		-- enough area, and compact enough to represent genuine inset
+		-- regions (not thin channel strips from collapsed teeth).
+		-- The area/perimeter ratio filters thin strips: a strip of width w
+		-- has ratio ≈ w/2, while compact shapes have ratio ≈ min_dim/4+.
+		for _, cyc in cycles2 do
+			local poly: { Vector2 } = {}
+			for _, ni in cyc do table.insert(poly, allNodes[ni]) end
+			local area = PolygonInset.signedArea(poly)
+			if area <= AREA_EPS then continue end
+			if area > origArea + AREA_EPS then continue end
+			local minArea = distance * distance * 4
+			if area < minArea then continue end
+			local sample = sampleInteriorPoint(poly)
+			if not pointInPolygon(sample, ccwOrig) then continue end
+			local perimeter = 0.0
+			local np = #poly
+			for i = 1, np do
+				perimeter += (poly[(i % np) + 1] - poly[i]).Magnitude
+			end
+			if perimeter > 0 and area / perimeter < distance then continue end
+			-- Collapse small bumps created by original-boundary edges in the
+			-- DCEL.  A bump vertex is one whose perpendicular distance to the
+			-- line connecting its neighbors is less than the inset distance.
+			local changed = true
+			while changed do
+				changed = false
+				local cleaned: { Vector2 } = {}
+				local m = #poly
+				for i = 1, m do
+					local prev = poly[((i - 2) % m) + 1]
+					local cur = poly[i]
+					local nxt = poly[(i % m) + 1]
+					local baseLen = (nxt - prev).Magnitude
+					if baseLen > AREA_EPS then
+						local cross = math.abs(
+							(cur.X - prev.X) * (nxt.Y - prev.Y)
+							- (nxt.X - prev.X) * (cur.Y - prev.Y)
+						)
+						local height = cross / baseLen
+						if height < distance then
+							changed = true
+							continue
+						end
+					end
+					table.insert(cleaned, cur)
+				end
+				if #cleaned >= 3 then
+					poly = cleaned
+				else
+					break
+				end
+			end
+			table.insert(result, poly)
+		end
+	end
+
 	return result
 end
 
@@ -655,7 +854,8 @@ local function arrangementSubtract(
 			holes = {},
 		}
 		for hi, h in holeOutsets do
-			if not pointInPolygon(h[1], outerInset) then
+			local sample = sampleInteriorPoint(h)
+			if not pointInPolygon(sample, outerInset) then
 				continue
 			end
 			local insideAnother = false
@@ -663,7 +863,7 @@ local function arrangementSubtract(
 				if hi == hj then
 					continue
 				end
-				if pointInPolygon(h[1], oh) then
+				if pointInPolygon(sample, oh) then
 					insideAnother = true
 					break
 				end
@@ -963,7 +1163,195 @@ end
 -- polygon-union dependency and no accumulation of merge errors.
 --------------------------------------------------------------------------------
 
-local HOLE_FRAGMENT_AREA_RATIO = 1e-4
+local HOLE_FRAGMENT_AREA_RATIO = 5e-3
+
+--- Remove zero-width slit appendages left after splitting at bridge points.
+--- When a polygon is split at a shared vertex, one sub-polygon may retain a
+--- "slit" — a pair of collinear edges going out to the former bridge point
+--- and back.  This function removes such slit-tip vertices (where adjacent
+--- edges are anti-parallel) and consecutive duplicate vertices.
+local function cleanSlitVertices(poly: { Vector2 }, eps: number): { Vector2 }
+	local changed = true
+	while changed do
+		changed = false
+		local n = #poly
+		if n < 4 then
+			break
+		end
+		local cleaned: { Vector2 } = {}
+		for i = 1, n do
+			local prev = poly[((i - 2) % n) + 1]
+			local curr = poly[i]
+			local nxt = poly[(i % n) + 1]
+			if (curr - nxt).Magnitude < eps then
+				changed = true
+				continue
+			end
+			local d1 = curr - prev
+			local d2 = nxt - curr
+			local len1 = d1.Magnitude
+			local len2 = d2.Magnitude
+			if len1 < eps then
+				table.insert(cleaned, curr)
+				continue
+			end
+			local cross = d1.X * d2.Y - d1.Y * d2.X
+			local dot = d1.X * d2.X + d1.Y * d2.Y
+			if math.abs(cross) / (len1 * len2) < 0.01 and dot < 0 then
+				changed = true
+				continue
+			end
+			table.insert(cleaned, curr)
+		end
+		if #cleaned >= 3 then
+			poly = cleaned
+		else
+			break
+		end
+	end
+	return poly
+end
+
+--- Split a merged-hole boundary into individual hole loops at bridge pinch
+--- points.  FrostingBuilder connects holes via zero-width bridges that
+--- create near-coincident vertex pairs in the boundary.  This function
+--- finds such pairs and splits the polygon at each, keeping only
+--- sub-polygons with ≥ `minLoopVerts` vertices (individual hole loops).
+--- Smaller sub-polygons (bridge junction artifacts) are discarded.
+--- After splitting, slit appendages (from the bridge edges) are cleaned.
+local function splitBridgedHole(
+	poly: { Vector2 },
+	threshold: number,
+	minLoopVerts: number
+): { { Vector2 } }
+	local n = #poly
+	if n < minLoopVerts * 2 then
+		return { poly }
+	end
+
+	local bestDist = math.huge
+	local bestI, bestJ = 0, 0
+	for i = 1, n do
+		for j = i + 2, n do
+			if i == 1 and j == n then
+				continue
+			end
+			local d = (poly[i] - poly[j]).Magnitude
+			if d < threshold and d < bestDist then
+				local fwd = j - i + 1
+				local bwd = n - j + i + 1
+				local small = math.min(fwd, bwd)
+				if small >= minLoopVerts then
+					bestDist = d
+					bestI, bestJ = i, j
+				end
+			end
+		end
+	end
+
+	if bestI == 0 then
+		return { poly }
+	end
+
+	local sub1: { Vector2 } = {}
+	for k = bestI, bestJ do
+		table.insert(sub1, poly[k])
+	end
+	local sub2: { Vector2 } = {}
+	for k = bestJ, n do
+		table.insert(sub2, poly[k])
+	end
+	for k = 1, bestI do
+		table.insert(sub2, poly[k])
+	end
+
+	local result: { { Vector2 } } = {}
+	for _, subPoly in { sub1, sub2 } do
+		local cleaned = cleanSlitVertices(subPoly, threshold)
+		if #cleaned >= minLoopVerts then
+			for _, p in splitBridgedHole(cleaned, threshold, minLoopVerts) do
+				table.insert(result, p)
+			end
+		end
+	end
+	return if #result > 0 then result else { poly }
+end
+
+--- Collapse small diamond-shaped concavities at self-touching pinch points.
+--- When the raw offset of a merged-hole boundary creates coincident vertices,
+--- small loops (diamonds) form at each touch point.  This function removes
+--- the intermediate vertices of loops with ≤ `maxLoopVerts` vertices and
+--- merges the coincident pinch pair into a single vertex, eliminating the
+--- concavity while preserving the polygon's overall topology.  Larger
+--- self-touching loops (which connect hex hole sections to the center hole)
+--- are left intact — the ear-clipper's own pinch-split handles those during
+--- triangulation, correctly separating individual hole loops.
+local function collapsePinchLoops(
+	poly: { Vector2 },
+	threshold: number,
+	maxLoopVerts: number
+): { Vector2 }
+	local n = #poly
+	if n < 6 then
+		return poly
+	end
+
+	local removeSet: { [number]: boolean } = {}
+
+	for i = 1, n do
+		if removeSet[i] then
+			continue
+		end
+		for j = i + 2, n do
+			if removeSet[j] then
+				continue
+			end
+			if i == 1 and j == n then
+				continue
+			end
+			if (poly[i] - poly[j]).Magnitude >= threshold then
+				continue
+			end
+
+			local fwdSize = j - i + 1
+			local bwdSize = n - j + i + 1
+
+			if fwdSize <= maxLoopVerts and fwdSize <= bwdSize then
+				for k = i + 1, j do
+					removeSet[k] = true
+				end
+			elseif bwdSize <= maxLoopVerts and bwdSize < fwdSize then
+				for k = j + 1, n do
+					removeSet[k] = true
+				end
+				for k = 1, i do
+					removeSet[k] = true
+				end
+			end
+		end
+	end
+
+	if next(removeSet) == nil then
+		return poly
+	end
+
+	local result: { Vector2 } = {}
+	for i = 1, n do
+		if not removeSet[i] then
+			table.insert(result, poly[i])
+		end
+	end
+
+	local cleaned: { Vector2 } = {}
+	for i = 1, #result do
+		local prev = result[((i - 2) % #result) + 1]
+		if (result[i] - prev).Magnitude > threshold then
+			table.insert(cleaned, result[i])
+		end
+	end
+
+	return if #cleaned >= 3 then cleaned else poly
+end
 
 local function offsetPWH(
 	pwh: { outer: { Vector2 }, holes: { { Vector2 } } },
@@ -977,11 +1365,80 @@ local function offsetPWH(
 		return {}
 	end
 
-	local allHoleOutsets: { { Vector2 } } = {}
+	-- Decompose merged-hole boundaries into individual loops before
+	-- offsetting.  FrostingBuilder bridges holes together, so
+	-- TopFaceExtractor returns a single polygon tracing all holes via
+	-- narrow slits.  Splitting at the bridge endpoints (near-coincident
+	-- non-adjacent vertices) recovers individual hole loops, each offset
+	-- independently.  When individual hole outsets overlap (as in
+	-- Honeycomb), we keep them as separate holes rather than computing
+	-- their union, so frosting fills the gaps near the outer boundary.
+	local individualHoles: { { Vector2 } } = {}
 	for _, h in pwh.holes do
 		local hCcw = PolygonInset.ensureCCW(h)
-		for _, o in offset(hCcw, -distance) do
+		local bridgeThreshold = math.abs(distance) * 0.2
+		local parts = splitBridgedHole(hCcw, bridgeThreshold, 6)
+		for _, part in parts do
+			local cleaned = cleanSlitVertices(part, bridgeThreshold)
+			if #cleaned >= 3 then
+				table.insert(individualHoles, cleaned)
+			end
+		end
+	end
+
+	local allHoleOutsets: { { Vector2 } } = {}
+	for _, h in individualHoles do
+		for _, o in offset(h, -distance) do
 			table.insert(allHoleOutsets, o)
+		end
+	end
+
+	-- Collapse bridge-expansion strips in hole outsets.  When a merged-hole
+	-- boundary has a zero-width bridge (self-touching vertex), offsetting
+	-- expands the bridge to 2*distance width, creating an unwanted corridor
+	-- strip.  Detect by finding collinear vertices (a vertex on the line
+	-- between its neighbors, indicating it was the original bridge point),
+	-- then snap the corresponding return-path vertices back toward the
+	-- bridge line so the strip nearly closes (epsilon-width).
+	for hIdx, holeOutset in allHoleOutsets do
+		local n = #holeOutset
+		if n <= 4 then continue end
+		local BRIDGE_EPS = math.max(callEps * 10, math.abs(distance) * 0.01)
+		local changed = false
+		local poly = table.clone(holeOutset)
+		for i = 1, n do
+			local prev = poly[((i - 2) % n) + 1]
+			local curr = poly[i]
+			local nxt = poly[(i % n) + 1]
+			local d1 = curr - prev
+			local d2 = nxt - curr
+			local len1 = d1.Magnitude
+			local len2 = d2.Magnitude
+			if len1 < BRIDGE_EPS or len2 < BRIDGE_EPS then continue end
+			local cross = d1.X * d2.Y - d1.Y * d2.X
+			local dot = d1.X * d2.X + d1.Y * d2.Y
+			if math.abs(cross) / (len1 * len2) > 0.01 or dot <= 0 then continue end
+			-- curr is collinear with prev and nxt (same direction) → bridge point.
+			-- The bridge line runs along d1's direction through curr.
+			-- Find return-path vertices displaced ~2*distance perpendicular.
+			local dir = d1.Unit
+			local perp = Vector2.new(-dir.Y, dir.X)
+			local bridgePerp = perp:Dot(curr)
+			local targetDist = math.abs(distance) * 2
+			for j = 1, n do
+				if j == i or j == ((i - 2) % n) + 1 or j == (i % n) + 1 then continue end
+				local vj = poly[j]
+				local perpJ = perp:Dot(vj)
+				local gap = math.abs(perpJ - bridgePerp)
+				if gap > targetDist * 0.5 and gap < targetDist * 1.5 then
+					local shift = bridgePerp - perpJ + math.sign(perpJ - bridgePerp) * BRIDGE_EPS
+					poly[j] = vj + perp * shift
+					changed = true
+				end
+			end
+		end
+		if changed then
+			allHoleOutsets[hIdx] = poly
 		end
 	end
 
